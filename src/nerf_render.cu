@@ -5,6 +5,8 @@
 #include <nerf-cuda/nerf_network.h>
 #include <nerf-cuda/nerf_render.h>
 #include <nerf-cuda/render_utils.h>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image/stb_image_write.h>
 #include <tiny-cuda-nn/encodings/grid.h>
 #include <tiny-cuda-nn/gpu_matrix.h>
 #include <tiny-cuda-nn/gpu_memory.h>
@@ -19,7 +21,9 @@
 #include <set>
 #include <typeinfo>
 #include <vector>
-#include "omp.h"
+
+#define maxThreadsPerBlock 1024
+#define PI acos(-1)
 
 using namespace Eigen;
 using namespace tcnn;
@@ -27,411 +31,571 @@ namespace fs = filesystem;
 
 NGP_NAMESPACE_BEGIN
 
-json merge_parent_network_config(const json& child,
-                                 const fs::path& child_filename) {
-  if (!child.contains("parent")) {
-    return child;
-  }
-  fs::path parent_filename =
-      child_filename.parent_path() / std::string(child["parent"]);
-  tlog::info() << "Loading parent network config from: "
-               << parent_filename.str();
-  std::ifstream f{parent_filename.str()};
-  json parent = json::parse(f, nullptr, true, true);
-  parent = merge_parent_network_config(parent, parent_filename);
-  parent.merge_patch(child);
-  return parent;
+Eigen::Matrix<float, 4, 4> trans_t(float t){
+  Eigen::Matrix<float, 4, 4> mat;
+  mat << 1.0, 0.0, 0.0, 0.0,
+         0.0, 1.0, 0.0, 0.0,
+         0.0, 0.0, 1.0, t,
+         0.0, 0.0, 0.0, 1.0;
+  return mat;
+}
+
+Eigen::Matrix<float, 4, 4> rot_phi(float phi){
+  Eigen::Matrix<float, 4, 4> mat;
+  mat << 1.0, 0.0, 0.0, 0.0,
+         0.0, cos(phi), -sin(phi), 0.0,
+         0.0, sin(phi),  cos(phi), 0.0,
+         0.0, 0.0, 0.0, 1.0;
+  return mat;
+}
+
+Eigen::Matrix<float, 4, 4> rot_theta(float th){
+  Eigen::Matrix<float, 4, 4> mat;
+  mat << cos(th), 0.0, -sin(th), 0.0,
+         0.0, 1.0, 0.0, 0.0,
+         sin(th), 0.0,  cos(th), 0.0,
+         0.0, 0.0, 0.0, 1.0;
+  return mat;
 }
 
 NerfRender::NerfRender() {
-  m_network_config = {};
-  m_density_grid = GPUMemory<float>(1);
+  std::cout << "Hello, NerfRender!" << std::endl;
 }
 
 NerfRender::~NerfRender() {}
 
-json NerfRender::load_network_config(const fs::path& network_config_path) {
-  if (!network_config_path.empty()) {
-    m_network_config_path = network_config_path;
-  }
+void NerfRender::load_nerf_tree(long* index_voxels_coarse_h,
+                                float* sigma_voxels_coarse_h,
+                                float* voxels_fine_h,
+                                const int64_t* cg_s,
+                                const int64_t* fg_s) {
+  std::cout << "load_nerf_tree" << std::endl;
+  m_cg_s << cg_s[0], cg_s[1], cg_s[2];
+  m_fg_s << fg_s[0], fg_s[1], fg_s[2], fg_s[3], fg_s[4];
+  std::cout << m_cg_s << std::endl;
+  std::cout << m_fg_s << std::endl;
 
-  tlog::info() << "Loading network config from: " << network_config_path;
+  int coarse_grid_num = m_cg_s[0] * m_cg_s[1] * m_cg_s[2];
+  std::cout << "coarse_grid_num: " << coarse_grid_num << std::endl;
 
-  if (network_config_path.empty() || !network_config_path.exists()) {
-    throw std::runtime_error{std::string{"Network config \""} +
-                             network_config_path.str() + "\" does not exist."};
-  }
+  int fine_grid_num = m_fg_s[0] * m_fg_s[1] * m_fg_s[2] * m_fg_s[3] * m_fg_s[4];
+  std::cout << "coarse_grid_num: " << fine_grid_num << std::endl;
 
-  json result;
-  if (equals_case_insensitive(network_config_path.extension(), "json")) {
-    std::ifstream f{network_config_path.str()};
-    result = json::parse(f, nullptr, true, true);
-    result = merge_parent_network_config(result, network_config_path);
-  } else if (equals_case_insensitive(network_config_path.extension(),
-                                     "msgpack")) {
-    std::ifstream f{network_config_path.str(), std::ios::in | std::ios::binary};
-    result = json::from_msgpack(f);
-    // we assume parent pointers are already resolved in snapshots.
-  }
-
-  return result;
-}
-
-void NerfRender::reload_network_from_file(
-    const std::string& network_config_path) {
-  if (!network_config_path.empty()) {
-    m_network_config_path = network_config_path;
-    tlog::info() << m_network_config_path.extension() ;
-    if (equals_case_insensitive(m_network_config_path.extension(), "msgpack")) {
-      load_snapshot(network_config_path);
-      reset_network();
-      m_nerf_network->deserialize(m_network_config["snapshot"]);
-    } else {
-      throw std::runtime_error{"Input file with wrong extension!"};
-    }
-  }
-}
-
-void NerfRender::reset_network() {
-  // reset the random seed
-  m_rng = default_rng_t{m_seed};
-
-  // Default config
-  json config = m_network_config;
-  json& encoding_config = config["encoding"];
-  json& network_config = config["network"];
-  json& dir_encoding_config = config["dir_encoding"];
-  json& rgb_network_config = config["rgb_network"];
-  uint32_t n_dir_dims = 3;
-  uint32_t n_pos_dims = 3;
-  uint32_t n_extra_dims = 0;  // Now, it's set to zero but it needs furture
-                              // check! By Hangkun, 2022/06/30
-
-  // Automatically determine certain parameters if we're dealing with the
-  // (hash)grid encoding
-  if (to_lower(encoding_config.value("otype", "OneBlob")).find("grid") !=
-      std::string::npos) {
-    encoding_config["n_pos_dims"] = n_pos_dims;  // 3 dimenison input
-
-    const uint32_t n_features_per_level =
-        encoding_config.value("n_features_per_level", 2u);
-    uint32_t m_num_levels = 16u;
-
-    if (encoding_config.contains("n_features") &&
-        encoding_config["n_features"] > 0) {
-      m_num_levels =
-          (uint32_t)encoding_config["n_features"] / n_features_per_level;
-    } else {
-      m_num_levels = encoding_config.value("n_levels", 16u);
-    }
-
-    // m_level_stats.resize(m_num_levels);
-    // m_first_layer_column_stats.resize(m_num_levels);
-
-    const uint32_t log2_hashmap_size =
-        encoding_config.value("log2_hashmap_size", 15);
-
-    uint32_t m_base_grid_resolution =
-        encoding_config.value("base_resolution", 0);
-    if (!m_base_grid_resolution) {
-      m_base_grid_resolution = 1u << ((log2_hashmap_size) / n_pos_dims);
-      encoding_config["base_resolution"] = m_base_grid_resolution;
-    }
-
-    float desired_resolution = 2048.0f;  // Desired resolution of the finest
-                                         // hashgrid level over the unit cube
-
-    // Automatically determine suitable per_level_scale
-    float m_per_level_scale = encoding_config.value("per_level_scale", 0.0f);
-    if (m_per_level_scale <= 0.0f && m_num_levels > 1) {
-      m_per_level_scale =
-          std::exp(std::log(desired_resolution * (float)m_bound /
-                            (float)m_base_grid_resolution) /
-                   (m_num_levels - 1));
-      encoding_config["per_level_scale"] = m_per_level_scale;
-    }
-
-    tlog::info() << "GridEncoding: "
-                 << " Nmin=" << m_base_grid_resolution
-                 << " b=" << m_per_level_scale << " F=" << n_features_per_level
-                 << " T=2^" << log2_hashmap_size << " L=" << m_num_levels;
-  }
-
-  // Generate the network
-  m_nerf_network = std::make_shared<NerfNetwork<precision_t>>(
-      n_pos_dims, n_dir_dims, n_extra_dims,
-      n_pos_dims,  // The offset of 1 comes from the dt member variable of
-                       // NerfCoordinate. HACKY
-      encoding_config, dir_encoding_config, network_config, rgb_network_config);
-}
-
-void NerfRender::set_resolution(Eigen::Vector2i res)
-{
-  resolution = res;
-
-  int N = resolution[0] * resolution[1];  // number of pixels
-  // initial points corresponding to pixels, in world coordination
-  rays_o = tcnn::GPUMatrixDynamic<float>(3, N, tcnn::RM);
-  // direction corresponding to pixels,in world coordination
-  rays_d = tcnn::GPUMatrixDynamic<float>(3, N, tcnn::RM);
-  // Calculate rays' intersection time (near and far) with aabb
-  nears = tcnn::GPUMatrixDynamic<float>(1, N, tcnn::RM);
-  fars = tcnn::GPUMatrixDynamic<float>(1, N, tcnn::RM);
-  //  allocate outputs
-  weight_sum = tcnn::GPUMatrixDynamic<float>(1, N, tcnn::RM);  // the accumlate weight of each ray
-  depth = tcnn::GPUMatrixDynamic<float>(1, N, tcnn::RM);  // output depth img
-  image = tcnn::GPUMatrixDynamic<float>(N, 3, tcnn::RM);  // output rgb image
-  // store the alive rays number
-  alive_counter = tcnn::GPUMatrixDynamic<int>(1, 1, tcnn::RM);
-  // the alive rays' IDs in N (N >= n_alive, but we only use first n_alive)
-  // 2 is used to loop old/new
-  rays_alive = tcnn::GPUMatrixDynamic<int>(2, N, tcnn::RM);
-  // the alive rays' time, we only use the first n_alive.
-  // dead rays are marked by rays_t < 0
-  //  2 is used to loop old/new
-  rays_t = tcnn::GPUMatrixDynamic<float>(2, N, tcnn::RM);
-
-  xyzs = tcnn::GPUMatrixDynamic<float>(3, div_round_up(N, 128) * 128, tcnn::CM);
-  // all generated points' view dirs.
-  dirs = tcnn::GPUMatrixDynamic<float>(3, div_round_up(N, 128) * 128, tcnn::CM);
-  // all generated points' deltas
-  //(here we record two deltas, the first is for RGB, the second for depth).
-  deltas = tcnn::GPUMatrixDynamic<float>(2, div_round_up(N, 128) * 128, tcnn::CM);
-
-  // volume density
-  sigmas = tcnn::GPUMatrixDynamic<float>(1, div_round_up(N, 128) * 128, tcnn::RM);
-  // emitted color
-  rgbs = tcnn::GPUMatrixDynamic<float>(div_round_up(N, 128) * 128, 3, tcnn::RM);
-
-  // concated input
-  network_input = tcnn::GPUMatrixDynamic<float>(m_nerf_network->input_width(),
-                                                div_round_up(N, 128) * 128, tcnn::RM);
-  // concated output
-  network_output = tcnn::GPUMatrixDynamic<precision_t>(
-        m_nerf_network->padded_output_width(), div_round_up(N, 128) * 128, tcnn::RM);
+  m_index_voxels_coarse.resize(coarse_grid_num);
+  m_index_voxels_coarse.copy_from_host(index_voxels_coarse_h);
+  m_sigma_voxels_coarse.resize(coarse_grid_num);
+  m_sigma_voxels_coarse.copy_from_host(sigma_voxels_coarse_h);
+  m_voxels_fine.resize(fine_grid_num);
+  m_voxels_fine.copy_from_host(voxels_fine_h);
   
-  deep_h = new float[N];
-  image_h = new float[N * 3];
-  us_image = new unsigned char [N*3];
-  us_depth = new unsigned char [N];
+  float host_data[3] = {0, 0, 0};
+  m_sigma_voxels_coarse.copy_to_host(host_data,3);
+  std::cout << "host_data[1]: " << host_data[1] << std::endl;
 }
 
-Image NerfRender::render_frame(struct Camera cam, Eigen::Matrix<float, 4, 4> pos) {
-  // cam : parameters of cam
-  // pos : camera external parameters
-  // resolution : [Width, Height]
+Eigen::Matrix<float, 4, 4> pose_spherical(float theta, float phi, float radius) {
+  Eigen::Matrix<float, 4, 4> c2w;
+  c2w = trans_t(radius);
+  c2w = rot_phi(phi / 180. * (float)PI) * c2w;
+  c2w = rot_theta(theta / 180. * (float)PI) * c2w;
+  Eigen::Matrix<float, 4, 4> temp_mat;
+  temp_mat << -1., 0., 0., 0.,
+               0., 0., 1., 0.,
+               0., 1., 0., 0.,
+               0., 0., 0., 1.; 
+  c2w = temp_mat * c2w; 
+  return c2w;
+}
 
-  int N = resolution[0] * resolution[1];  // number of pixels
-
-  // functions to generate rays_o and rays_d, it takes camera parameters and
-  // resolution as input
-  generate_rays(cam, pos, resolution, rays_o, rays_d);
-
-
-  // caliucate nears and fars
-  kernel_near_far_from_aabb<<<div_round_up(N, m_num_thread), m_num_thread>>>(
-      rays_o.view(), rays_d.view(), m_aabb.data(), N, m_min_near, nears.view(),
-      fars.view());
-
-  // initial weight_sum, image and depth with 0
-  weight_sum.initialize_constant(0); 
-  depth.initialize_constant(0);
-  image.initialize_constant(0);
-  std::cout << "initial weight_sum, image and depth with 0" << std::endl;
-
-  int num_alive = N;  // initialize the initial number alive as N
-  // initial with 0
-  alive_counter.initialize_constant(0);
-  rays_alive.initialize_constant(0);
-  rays_t.initialize_constant(0);
-  std::cout << "initial alive_counter rays_alive rays_t with 0" << std::endl;
-
-  int step = 0;          // the current march step
-  int i = 0;             // the flag to index old and new rays
-  while (step < m_max_infer_steps) {
-    if (step == 0) {
-      // init rays at first step
-      init_step0<<<div_round_up(num_alive, m_num_thread), m_num_thread>>>(
-          rays_alive.view(), rays_t.view(), num_alive, nears.view());
-    } else {
-      // initialize alive_couter's value with 0
-      int tmp_value = 0;
-      cudaMemcpy(&alive_counter.view()(0, 0), &tmp_value, 1 * sizeof(int),
-                 cudaMemcpyHostToDevice);
-
-      // remove dead rays and reallocate alive rays, to accelerate next ray
-      // marching
-      int new_i = i % 2;
-      int old_i = (i + 1) % 2;
-      kernel_compact_rays<<<div_round_up(num_alive, m_num_thread), m_num_thread>>>(
-          num_alive, rays_alive.view(), rays_t.view(), alive_counter.view(),
-          new_i, old_i);
-      cudaMemcpy(&num_alive, &alive_counter.view()(0, 0), 1 * sizeof(int),
-                 cudaMemcpyDeviceToHost);
-    }
-    if (num_alive <= 0) {
-      break;  // exit loop if no alive rays
-    }
-
-    // decide compact_steps
-    int num_step = max(min(N / num_alive, 8), 1);
-    // round it to the multiply of 128
-    int step_x_alive = div_round_up(num_alive * num_step, 128) * 128;
-
-    // march rays
-    kernel_march_rays<<<div_round_up(num_alive, m_num_thread), m_num_thread>>>(
-        num_alive, num_step, rays_alive.view(), rays_t.view(), rays_o.view(),
-        rays_d.view(), m_bound, m_dt_gamma, m_dg_cascade, m_dg_h,
-        m_density_grid.data(), m_mean_density, nears.view(), fars.view(),
-        xyzs.view(), dirs.view(), deltas.view(), m_perturb, i);
-
-    tcnn::linear_kernel(linear_transformer<float>, 0, nullptr, step_x_alive * 3,
-      1.0/(2 * m_bound), 0.5, xyzs.data(), xyzs.data());
-    tcnn::linear_kernel(linear_transformer<float>, 0, nullptr, step_x_alive * 3,
-      0.5, 0.5, dirs.data(), dirs.data());
-    concat_network_in_and_out<<<div_round_up(step_x_alive, m_num_thread),
-                                m_num_thread>>>(
-        xyzs.view(), dirs.view(),
-        network_input.view(), step_x_alive, xyzs.rows(), dirs.rows());
-    // forward through the network
-    m_nerf_network->inference_mixed_precision_impl(
-        nullptr, network_input, network_output);
-
-    // decompose network output
-    decompose_network_in_and_out<<<div_round_up(step_x_alive, m_num_thread),
-                                   m_num_thread>>>(
-        sigmas.view(), rgbs.view(), network_output.view(), step_x_alive,
-        sigmas.rows(), rgbs.cols());
-    matrix_multiply_1x1n<<<div_round_up(step_x_alive, m_num_thread), m_num_thread>>>(
-        m_density_scale, step_x_alive, sigmas.view());
-
-    // composite rays
-    kernel_composite_rays<<<div_round_up(num_alive, m_num_thread), m_num_thread>>>(
-        num_alive, num_step, rays_alive.view(), rays_t.view(), sigmas.view(),
-        rgbs.view(), deltas.view(), weight_sum.view(), depth.view(),
-        image.view(), i);
-    step += num_step;
-    i += 1;
+// line 229-249 @ efficient-nerf-render-demo/example-app/example-app.cpp
+__global__ void set_z_vals(float* z_vals, const int N) {
+  const int index = threadIdx.x + blockIdx.x * blockDim.x;
+  if (index >= N) {
+    return;
   }
-  std::cout << "get image and depth" << std::endl;
-  // get final image and depth
-  get_image_and_depth<<<div_round_up(N, m_num_thread), m_num_thread>>>(
-      image.view(), depth.view(), nears.view(), fars.view(), weight_sum.view(),
-      m_bg_color, N);
+  float near = 2.0; // val_dataset.near
+  float far = 6.0; // val_dataset.far
+  z_vals[index] = near + (far-near) / (N-1) * index;
+}
 
-  cudaMemcpy(deep_h, &depth.view()(0, 0), N * sizeof(float), cudaMemcpyDeviceToHost);
-  cudaMemcpy(image_h, &image.view()(0, 0), N * sizeof(float) * 3, cudaMemcpyDeviceToHost);
+// line 251-254 @ efficient-nerf-render-demo/example-app/example-app.cpp
+__global__ void set_xyz(MatrixView<float> xyz, 
+                        MatrixView<float> rays_o,
+                        MatrixView<float> rays_d,
+                        float* z_vals, 
+                        int N_rays, 
+                        int N_samples) {
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;
+  const int j = threadIdx.y + blockIdx.y * blockDim.y;
+  if (i >= N_rays || j >= N_samples) {
+    return;
+  }
+  xyz(i*N_samples+j, 0) = rays_o(i, 0) + z_vals[j] * rays_d(i, 0);
+  xyz(i*N_samples+j, 1) = rays_o(i, 1) + z_vals[j] * rays_d(i, 1);
+  xyz(i*N_samples+j, 2) = rays_o(i, 2) + z_vals[j] * rays_d(i, 2);
+}
+
+// line 128-137 @ efficient-nerf-render-demo/example-app/example-app.cpp
+__global__ void calc_index_coarse(MatrixView<int> ijk_coarse, MatrixView<float> xyz, int grid_coarse, const int N) {
+  const int index = threadIdx.x + blockIdx.x * blockDim.x;
+  if (index >= N) {
+    return;
+  }
+  float coord_scope = 3.0;
+  float xyz_min = -coord_scope;
+  float xyz_max = coord_scope;
+  float xyz_scope = xyz_max - xyz_min;
+
+  for (int i=0; i<3; i++) {
+    ijk_coarse(index, i) = int((xyz(index, i) - xyz_min) / xyz_scope * grid_coarse);
+    ijk_coarse(index, i) = ijk_coarse(index, i) < 0? 0 : ijk_coarse(index, i);
+    ijk_coarse(index, i) = ijk_coarse(index, i) > grid_coarse-1? grid_coarse-1 : ijk_coarse(index, i);
+  }
+
+}
+
+__global__ void query_coarse_sigma(float* sigmas, float* sigma_voxels_coarse, MatrixView<int> ijk_coarse, Eigen::Vector3i cg_s, const int N) {
+  const int index = threadIdx.x + blockIdx.x * blockDim.x;
+  if (index >= N) {
+    return;
+  }
+  int x = ijk_coarse(index, 0);
+  int y = ijk_coarse(index, 1);
+  int z = ijk_coarse(index, 2);
+  sigmas[index] = sigma_voxels_coarse[x*cg_s[1]*cg_s[2] + y*cg_s[2] + z];
+}
+
+__global__ void set_dir(int w, int h, float focal, Eigen::Matrix<float, 4, 4> c2w, MatrixView<float> rays_o, MatrixView<float> rays_d){
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;   // h*w
+  const int j = threadIdx.y + blockIdx.y * blockDim.y;   // w
+  // tcnn::GPUMatrixDynamic<float> dirs(h * w, 3, tcnn::RM);
+  if( i >= h*w || j >= w){
+    return;
+  }
+  float dirs[3];
+  dirs[0] = (float)((int)(i / w) - w/2) / focal;
+  dirs[1] = (float)(j - h/2) / focal;
+  dirs[2] = -1.;
+  float sum = pow(dirs[0], 2) + pow(dirs[1], 2) + pow(dirs[2], 2);
+  dirs[0] /= sum;
+  dirs[1] /= sum;
+  dirs[2] /= sum;
+  // dirs((int)(i / w) * w + j, 0) = (float)((int)(i / w) - w/2) / focal;
+  // dirs((int)(i / w) * w + j, 1) = (float)(j - h/2) / focal;
+  // dirs((int)(i / w) * w + j, 2) = -1;
+  // float sum =  dirs((int)(i / w) * w + j, 0) ^ 2 + dirs((int)(i / w) * w + j, 1) ^ 2 + dirs((int)(i / w) * w + j, 2) ^ 2;
+  // dirs((int)(i / w) * w + j, 0) /= sum;
+  // dirs((int)(i / w) * w + j, 1) /= sum;
+  // dirs((int)(i / w) * w + j, 2) /= sum;
+
+  // get_rays 
+  // rays_d((int)(i / w) * w + j, 0) = c2w(0, 0) * dirs((int)(i / w) * w + j, 0) \
+  //                                 + c2w(0, 1) * dirs((int)(i / w) * w + j, 1) \
+  //                                 + c2w(0, 2) * dirs((int)(i / w) * w + j, 2);
+  // rays_d((int)(i / w) * w + j, 1) = c2w(1, 0) * dirs((int)(i / w) * w + j, 0) \
+  //                                 + c2w(1, 1) * dirs((int)(i / w) * w + j, 1) \
+  //                                 + c2w(1, 2) * dirs((int)(i / w) * w + j, 2);
+  // rays_d((int)(i / w) * w + j, 2) = c2w(2, 0) * dirs((int)(i / w) * w + j, 0) \
+  //                                 + c2w(2, 1) * dirs((int)(i / w) * w + j, 1) \
+  //                                 + c2w(2, 2) * dirs((int)(i / w) * w + j, 2);
+  rays_d((int)(i / w) * w + j, 0) = c2w(0,0) * dirs[0] + c2w(0,1) * dirs[1] + c2w(0,2) * dirs[2];
+  rays_d((int)(i / w) * w + j, 1) = c2w(1,0) * dirs[0] + c2w(1,1) * dirs[1] + c2w(1,2) * dirs[2];
+  rays_d((int)(i / w) * w + j, 2) = c2w(2,0) * dirs[0] + c2w(2,1) * dirs[1] + c2w(2,2) * dirs[2];
+  rays_o((int)(i / w) * w + j, 0) = c2w(0, 3);
+  rays_o((int)(i / w) * w + j, 1) = c2w(1, 3);
+  rays_o((int)(i / w) * w + j, 2) = c2w(2, 3);
+}
+
+__global__ void get_alphas(const int N_rays, const int N_samples, float* z_vals, float* sigmas, float* alphas){
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;   // N_rays
+  const int j = threadIdx.y + blockIdx.y * blockDim.y;   // N_samples
+  if(i >= N_rays){
+    return;
+  }
+  if(j >= N_samples){
+    return;
+  }
+  float delta_coarse;
+  if(j < N_samples-1) 
+    delta_coarse = z_vals[j+1] - z_vals[j];
+  if(j == N_samples-1)
+    delta_coarse = 1e5;
+  float alpha = 1.0 - exp(-delta_coarse * log(1 + std::exp(sigmas[i * N_samples + j])));
+  //alpha = 1.0 - alpha + 1e-10;
+  alphas[i * N_samples + j] = alpha;
+}
+
+__global__ void get_cumprod(const int N_rays, const int N_samples, float* alphas, float* alphas_cumprod){
+  const int j = threadIdx.x + blockIdx.x * blockDim.x;   // N_rays
+  if(j >= N_rays){
+    return;
+  }
+  alphas_cumprod[j*N_samples+0] = 1.0;
+  //float cumprod = 1.0;
+  for(int i=1; i<N_samples; i++){
+    alphas_cumprod[j*N_samples+i] = alphas_cumprod[j*N_samples+i-1] * (1.0 - alphas[j*N_samples+i-1] + 1e-10);
+    //alphas_cumprod[j*N_samples+i] = cumprod;
+  }
+}
+
+__global__ void get_weights(const int N_rays, const int N_samples, float* alphas, float* alphas_cumprod, float* weights){
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;   // N_rays
+  const int j = threadIdx.y + blockIdx.y * blockDim.y;   // N_samples
+  if(i >= N_rays){
+    return;
+  }
+  if(j >= N_samples){
+    return;
+  }
+  weights[i*N_samples+j] = alphas[i*N_samples+j] * alphas_cumprod[i*N_samples+j];
+}
+
+void sigma2weights(tcnn::GPUMemory<float>& weights,    // N_rays*N_samples
+                   tcnn::GPUMemory<float>& z_vals,     // N_samples
+                   tcnn::GPUMemory<float>& sigmas) {   // N_rays*N_samples
+  // TODO
+  // line 258-261 @ efficient-nerf-render-demo/example-app/example-app.cpp
+  // use cuda to speed up
+  int N_samples = z_vals.size();
+  int N_rays = weights.size() / N_samples;
+  std::cout << "N_samples:" << N_samples << std::endl;
+  std::cout << "N_rays:" << N_rays << std::endl;
+  tcnn::GPUMemory<float> alphas(N_samples*N_rays);
+  tcnn::GPUMemory<float> alphas_cumprod((N_samples + 1)*N_rays);
   
-  #pragma omp parallel for num_threads(8)
-  for (int i = 0; i < N ; i++) {
-    us_depth[i] = (unsigned char) (255.0 * deep_h[i]);
-    us_image[i*3] = (unsigned char) (255.0 * image_h[i*3]); 
-    us_image[i*3+1] = (unsigned char) (255.0 * image_h[i*3+1]); 
-    us_image[i*3+2] = (unsigned char) (255.0 * image_h[i*3+2]); 
-  }
+  dim3 threadsPerBlock(maxThreadsPerBlock/32, 32);
+  dim3 numBlocks(div_round_up(N_rays, int(threadsPerBlock.x)), div_round_up(N_samples, int(threadsPerBlock.y)));
+  get_alphas<<<numBlocks, threadsPerBlock>>>(N_rays, N_samples, z_vals.data(), sigmas.data(), alphas.data());
 
-  Image img(resolution[0], resolution[1], us_image, us_depth);
-  return img;
+  std::cout << "get alphas" << std::endl;
+  get_cumprod<<<div_round_up(N_rays, maxThreadsPerBlock), maxThreadsPerBlock>>>(N_rays, N_samples, alphas.data(), alphas_cumprod.data());
+  get_weights<<<numBlocks, threadsPerBlock>>>(N_rays, N_samples, alphas.data(), alphas_cumprod.data(), weights.data());
+  std::cout << "sigma2weights" << std::endl;
 }
 
-void NerfRender::generate_rays(struct Camera cam,
-                               Eigen::Matrix<float, 4, 4> pos,
-                               Eigen::Vector2i resolution,
+__global__ void sum_rgbs(MatrixView<float> rgb_final, MatrixView<float> rgbs, float* weights, int N_samples, const int N) {
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;
+  if (i >= N) {
+    return;
+  }
+  float weights_sum = 0;
+  rgb_final(i, 0) = 0;
+  rgb_final(i, 1) = 0;
+  rgb_final(i, 2) = 0;
+  for (int j=0; j<N_samples; j++) {
+    weights_sum += weights[i*N_samples+j];
+    rgb_final(i, 0) += weights[i*N_samples+j] * rgbs(i*N_samples+j, 0);
+    rgb_final(i, 1) += weights[i*N_samples+j] * rgbs(i*N_samples+j, 1);
+    rgb_final(i, 2) += weights[i*N_samples+j] * rgbs(i*N_samples+j, 2);
+  }
+  rgb_final(i, 0) = rgb_final(i, 0) + 1 - weights_sum;
+  rgb_final(i, 1) = rgb_final(i, 1) + 1 - weights_sum;
+  rgb_final(i, 2) = rgb_final(i, 2) + 1 - weights_sum;
+}
+
+__global__ void get_weight_threasholds(float* weight_threasholds, float* weights, float weight_threashold, int N_samples, const int N) {
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;
+  if (i >= N) {
+    return;
+  }
+  float max_item = 0;
+  for (int j=0; j<N_samples; j++) {
+    if (max_item < weights[i*N_samples+j]) {
+      max_item = weights[i*N_samples+j];
+    }
+  }
+  if (max_item < weight_threashold) {
+    weight_threasholds[i] = max_item;
+  }
+  else {
+    weight_threasholds[i] = weight_threashold;
+  }
+}
+
+__global__ void query_fine(MatrixView<float> rgbs, 
+                           float* sigmas,
+                           float* weights_coarse, 
+                           MatrixView<float> xyz_, 
+                           MatrixView<float> dir_, 
+                           float weight_threashold, 
+                           long* index_voxels_coarse,
+                           float* voxels_fine,
+                           Eigen::Vector3i cg_s,
+                           Eigen::Matrix<int,5,1> fg_s,
+                           int N_importance, int N_samples_fine, int N_rays) {
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;
+  const int j = threadIdx.y + blockIdx.y * blockDim.y;
+  //const int N_samples_coarse = N_samples_fine / N_importance;
+  const int index_fine = i*N_samples_fine + j;
+  const int index_coarse = index_fine / N_importance;
+  if (i >= N_rays || j >= N_samples_fine) {
+    return;
+  }
+  // line 264 @ efficient-nerf-render-demo/example-app/example-app.cpp
+  if (weights_coarse[index_coarse] < weight_threashold) {
+    float sigma_default = -20.0;
+    sigmas[index_fine] = sigma_default;
+    rgbs(index_fine, 0) = 1.0;
+    rgbs(index_fine, 1) = 1.0;
+    rgbs(index_fine, 2) = 1.0;
+    return;
+  }
+
+  // calc_index_coarse
+  
+  int grid_coarse = cg_s[0];
+  float coord_scope = 3.0;
+  float xyz_min = -coord_scope;
+  float xyz_max = coord_scope;
+  float xyz_scope = xyz_max - xyz_min;
+
+  int ijk_coarse[3];
+
+  // query_coarse_index
+  for (int i=0; i<3; i++) {
+    ijk_coarse[i] = int((xyz_(index_fine, i) - xyz_min) / xyz_scope * grid_coarse);
+    ijk_coarse[i] = ijk_coarse[i] < 0? 0 : ijk_coarse[i];
+    ijk_coarse[i] = ijk_coarse[i] > grid_coarse-1? grid_coarse-1 : ijk_coarse[i];
+  }
+  int coarse_index = index_voxels_coarse[ijk_coarse[0]*cg_s[1]*cg_s[2]+ijk_coarse[1]*cg_s[2]+ijk_coarse[2]];
+
+  // calc_index_fine
+  
+  int grid_fine = 3;
+  int res_fine = grid_coarse * grid_fine;
+
+  int ijk_fine[3];
+
+  ijk_fine[0] = int((xyz_(index_fine, 0) - xyz_min) / xyz_scope * res_fine) % grid_fine;
+  ijk_fine[1] = int((xyz_(index_fine, 1) - xyz_min) / xyz_scope * res_fine) % grid_fine;
+  ijk_fine[2] = int((xyz_(index_fine, 2) - xyz_min) / xyz_scope * res_fine) % grid_fine;
+
+  // line 195 @ efficient-nerf-render-demo/example-app/example-app.cpp
+  sigmas[index_fine] = voxels_fine[coarse_index*fg_s[1]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[0]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[1]*fg_s[3]*fg_s[4] + ijk_fine[2]*fg_s[4]];
+
+  const int deg = 2;
+  const int dim_sh = (deg + 1) * (deg + 1);
+  float sh[3][dim_sh];
+
+  for (int k=0; k<fg_s[4]-1; k++) {
+    sh[k/dim_sh][k%dim_sh] = voxels_fine[coarse_index*fg_s[1]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[0]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[1]*fg_s[3]*fg_s[4] + ijk_fine[2]*fg_s[4] + k+1];
+  }
+
+  // eval_sh
+  float C0 = 0.28209479177387814;
+  float C1 = 0.4886025119029199;
+  float C2[5] = {1.0925484305920792, -1.0925484305920792, 0.31539156525252005, -1.0925484305920792, 0.5462742152960396};
+
+  float x = dir_(i, 0);
+  float y = dir_(i, 1);
+  float z = dir_(i, 2);
+
+  float xx = x * x;
+  float yy = y * y;
+  float zz = z * z;
+  float xy = x * y;
+  float yz = y * z;
+  float xz = x * z;
+  
+  for (int k=0; k<3; k++) {
+    rgbs(index_fine, k) = C0 * sh[k][0];
+    if (deg > 0) {
+      rgbs(index_fine, k) = (rgbs(index_fine, k) -    \
+                             C1 * y * sh[k][1] +      \
+                             C1 * z * sh[k][2] -      \
+                             C1 * x * sh[k][3]);
+      if (deg > 1) {
+        rgbs(index_fine, k) = (rgbs(index_fine, k) +                      \
+                               C2[0] * xy * sh[k][4] +                    \
+                               C2[1] * yz * sh[k][5] +                    \
+                               C2[2] * (2.0 * zz - xx - yy) * sh[k][6] +  \
+                               C2[3] * xz * sh[k][7] +                    \
+                               C2[4] * (xx - yy) * sh[k][8]);
+        }
+    }
+    // line 199 @ efficient-nerf-render-demo/example-app/example-app.cpp
+    rgbs(index_fine, k) = 1 / (1 + exp(-rgbs(index_fine, k)));
+    //rgbs(index_fine, k) = sh[k][0];
+  }
+
+}
+
+void NerfRender::inference(int N_rays, int N_samples_, int N_importance,
+                           tcnn::GPUMatrixDynamic<float>& rgb_fine,
+                           tcnn::GPUMatrixDynamic<float>& xyz_,
+                           tcnn::GPUMatrixDynamic<float>& dir_,
+                           tcnn::GPUMemory<float>& z_vals,    
+                           tcnn::GPUMemory<float>& weights_coarse) {
+  std::cout << "inference" << std::endl;
+  // TODO
+  // line 263-271 & 186-206 @ efficient-nerf-render-demo/example-app/example-app.cpp
+  // use cuda to speed up
+
+  float weight_threashold = 1e-5;
+  //tcnn::GPUMemory<float> weight_threasholds(N_rays);
+  //get_weight_threasholds<<<div_round_up(N_rays, maxThreadsPerBlock), maxThreadsPerBlock>>> (weight_threasholds.data(), weights_coarse.data(), weight_threashold, N_samples_, N_rays);
+
+  tcnn::GPUMatrixDynamic<float> rgbs(N_rays*N_samples_, 3, tcnn::RM);
+  tcnn::GPUMemory<float> sigmas(N_rays*N_samples_);
+  dim3 threadsPerBlock(maxThreadsPerBlock/32, 32);
+  dim3 numBlocks_coarse(div_round_up(N_rays, int(threadsPerBlock.x)), div_round_up(N_samples_, int(threadsPerBlock.y)));
+  query_fine<<<numBlocks_coarse, threadsPerBlock>>>(rgbs.view(), 
+                                                    sigmas.data(), 
+                                                    weights_coarse.data(), 
+                                                    xyz_.view(), 
+                                                    dir_.view(), 
+                                                    weight_threashold, 
+                                                    m_index_voxels_coarse.data(),
+                                                    m_voxels_fine.data(),
+                                                    m_cg_s, m_fg_s,
+                                                    N_importance, N_samples_, N_rays);
+  
+  tcnn::GPUMemory<float> weights(N_rays*N_samples_);
+  sigma2weights(weights, z_vals, sigmas);
+  sum_rgbs<<<div_round_up(N_rays, maxThreadsPerBlock), maxThreadsPerBlock>>> (rgb_fine.view(), rgbs.view(), weights.data(), N_samples_, N_rays);
+
+}
+
+void NerfRender::render_rays(int N_rays,
+                             tcnn::GPUMatrixDynamic<float>& rgb_fine,
+                             tcnn::GPUMatrixDynamic<float>& rays_o,
+                             tcnn::GPUMatrixDynamic<float>& rays_d,
+                             int N_samples=128, 
+                             int N_importance=5, 
+                             float perturb=0.) {
+  std::cout << "render_rays" << std::endl;
+  int N_samples_coarse = N_samples;
+  tcnn::GPUMemory<float> z_vals_coarse(N_samples_coarse);
+  set_z_vals<<<div_round_up(N_samples_coarse, maxThreadsPerBlock), maxThreadsPerBlock>>> (z_vals_coarse.data(), N_samples_coarse);
+
+  int N_samples_fine = N_samples * N_importance;
+  tcnn::GPUMemory<float> z_vals_fine(N_samples_fine);
+  set_z_vals<<<div_round_up(N_samples_fine, maxThreadsPerBlock), maxThreadsPerBlock>>> (z_vals_fine.data(), N_samples_fine);
+
+  tcnn::GPUMatrixDynamic<float> xyz_coarse(N_rays*N_samples_coarse, 3, tcnn::RM);
+  dim3 threadsPerBlock(maxThreadsPerBlock/32, 32);
+  dim3 numBlocks_coarse(div_round_up(N_rays, int(threadsPerBlock.x)), div_round_up(N_samples_coarse, int(threadsPerBlock.y)));
+  set_xyz<<<numBlocks_coarse, threadsPerBlock>>>(xyz_coarse.view(), rays_o.view(), rays_d.view(), z_vals_coarse.data(), N_rays, N_samples_coarse);
+
+
+  tcnn::GPUMatrixDynamic<float> xyz_fine(N_rays*N_samples_fine, 3, tcnn::RM);
+  dim3 numBlocks_fine(div_round_up(N_rays, int(threadsPerBlock.x)), div_round_up(N_samples_fine, int(threadsPerBlock.y)));
+  set_xyz<<<numBlocks_fine, threadsPerBlock>>>(xyz_fine.view(), rays_o.view(), rays_d.view(), z_vals_fine.data(), N_rays, N_samples_fine);
+
+  // line 155-161 @ efficient-nerf-render-demo/example-app/example-app.cpp
+  tcnn::GPUMatrixDynamic<int> ijk_coarse(N_rays*N_samples_coarse, 3, tcnn::RM);
+  calc_index_coarse<<<div_round_up(N_rays*N_samples_coarse, maxThreadsPerBlock), maxThreadsPerBlock>>> (ijk_coarse.view(), xyz_coarse.view(), m_cg_s[0], N_rays*N_samples_coarse);
+
+  tcnn::GPUMemory<float> sigmas(N_rays*N_samples_coarse);
+  query_coarse_sigma<<<div_round_up(N_rays*N_samples_coarse, maxThreadsPerBlock), maxThreadsPerBlock>>> (sigmas.data(), m_sigma_voxels_coarse.data(), ijk_coarse.view(), m_cg_s, N_rays*N_samples_coarse);
+
+  /*
+  int N = N_rays*N_samples_coarse;
+  float* host_data = new float[N];
+  sigmas.copy_to_host(host_data);
+  for (int i=0; i<50; i++) {
+    std::cout << host_data[i] << std::endl;
+  }
+  */
+  
+  /*
+  int N = N_rays*N_samples_coarse;
+  float* host_data = new float[N * 3];
+  tcnn::MatrixView<float> view = sigmas.view();
+  cudaMemcpy(host_data, &view(0,0), N*3 * sizeof(float), cudaMemcpyDeviceToHost);
+  for (int i=0; i<50; i++) {
+    for (int j=0; j<3; j++) {
+      std::cout << host_data[i*3+j] << "\t";
+    }
+    std::cout << std::endl;
+  }
+  */
+
+  // line 261 @ efficient-nerf-render-demo/example-app/example-app.cpp
+  tcnn::GPUMemory<float> weights_coarse(N_rays*N_samples_coarse);
+  sigma2weights(weights_coarse, z_vals_coarse, sigmas);
+
+  inference(N_rays, N_samples_fine, N_importance, rgb_fine, xyz_fine, rays_d, z_vals_fine, weights_coarse);
+
+  
+  //float host_data[N_samples_fine];
+  //z_vals_fine.copy_to_host(host_data);
+  //std::cout << host_data[0] << " " << host_data[1] << " " << host_data[2] << std::endl;
+}
+
+void NerfRender::generate_rays(int w,
+                               int h,
+                               float focal,
+                               Eigen::Matrix<float, 4, 4> c2w,
                                tcnn::GPUMatrixDynamic<float>& rays_o,
                                tcnn::GPUMatrixDynamic<float>& rays_d) {
-
-  int N = resolution[0] * resolution[1];  // number of pixels
-  std::cout << "N: " << N << std::endl;
-
-  Eigen::Matrix<float, 4, 4> new_pose = nerf_matrix_to_ngp(pos, m_scale);
-
-  int grid_size = ((N + m_num_thread) / m_num_thread);
-
-  tcnn::MatrixView<float> rays_o_view = rays_o.view();
-  set_rays_o<<<grid_size, m_num_thread>>>(rays_o_view, new_pose.block<3, 1>(0, 3), N);
-
-  tcnn::MatrixView<float> rays_d_view = rays_d.view();
-  set_rays_d<<<grid_size, m_num_thread>>>(
-      rays_d_view, cam, new_pose.block<3, 3>(0, 0), resolution[0], N);
+  // TODO
+  // line 287-292 @ efficient-nerf-render-demo/example-app/example-app.cpp
+  // use cuda to speed up
+  int N = w * h;
+  set_rays_o<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_o.view(), c2w.block<3, 1>(0, 3), N);
+  set_rays_d<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_d.view(), c2w.block<3, 3>(0, 0), focal, w, h);
+  //dim3 threadsPerBlock(maxThreadsPerBlock/32, 32);
+  //dim3 numBlocks(div_round_up(w * h, int(threadsPerBlock.x)), div_round_up(w, int(threadsPerBlock.y)));
+  //set_dir<<<numBlocks, threadsPerBlock>>>(w, h, focal, c2w, rays_o.view(), rays_d.view());
+  tlog::info() << c2w;
 }
 
-void NerfRender::generate_density_grid() {
-  const uint32_t H = m_dg_h;
-	const uint32_t H2= H*H;
-	// const uint32_t H3= H*H;//*H;
-	const uint32_t H3= H*H*H;
-	const float decay = 0.95;
-	std::cout << "dg size: " << m_density_grid.size() << std::endl;
-	std::vector<float> tmpV(m_dg_cascade*H3, 1.0/64);
-	std::cout << "tmpV size: " << tmpV.size() << std::endl;
-	m_density_grid.resize(m_dg_cascade*H3);
-	m_density_grid.copy_from_host(tmpV);
-	
-	std::cout << "dg size: " << m_density_grid.size() << std::endl;
-	tcnn::GPUMatrixDynamic<float> xyzs(3,H3);
-	tcnn::GPUMatrixDynamic<float> cas_xyzs(3,H3);
-	tcnn::GPUMatrixDynamic<precision_t> density_out(16,H3);
-	tcnn::GPUMatrixDynamic<float> tmp_density(1,H3);
-
-	int block_size = H;
-  int grid_size = 3*H3/block_size;
-
-	init_xyzs <<<grid_size, block_size>>> (xyzs.data(), 3*H3);
-
-	for(int cas=0;cas<m_dg_cascade;cas++){
-		float bound = 1<<cas < m_bound ? 1<<cas : m_bound;
-		float half_grid_size = bound/H;
-
-		dd_scale   <<<grid_size, block_size>>> (xyzs.data(), cas_xyzs.data(), 3*H3, bound-half_grid_size);
-		add_random <<<grid_size, block_size>>> (cas_xyzs.data(), m_rng, 3*H3, half_grid_size);
-
-		// m_nerf_network->density(nullptr,cas_xyzs,density_out);
-
-		dd_scale  <<<H2, H>>> (density_out.slice_rows(0, 1).data(), tmp_density.data(), H3, 0.001691);
-	}
-
-	dg_update <<<H2, H>>> (m_density_grid.data(), tmp_density.data(), decay, H3);
+__global__ void get_image(MatrixView<float> rgb_final, const int N, float* rgbs){
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;  // N
+  if(i >= N){
+    return;
+  }
+  rgbs[i * 3] = rgb_final(i, 0);
+  rgbs[i * 3 + 1] = rgb_final(i, 1);
+  rgbs[i * 3 + 2] = rgb_final(i, 2);
 }
 
-void NerfRender::load_snapshot(const std::string& filepath_string){
-  tlog::info() << "Reading snapshot";
-	auto config = load_network_config(filepath_string);
-	if(!config.contains("snapshot")){
-		throw std::runtime_error{"File " + filepath_string + " does not contain a snapshot."};
-	}
+void NerfRender::render_frame(int w, int h, float theta, float phi, float radius) {
+  auto c2w = pose_spherical(theta, phi, radius);
+  float focal = 0.5 * w / std::tan(0.5*0.6911112070083618);
+  int N = w * h;  // number of pixels
+  // initial points corresponding to pixels, in world coordination
+  tcnn::GPUMatrixDynamic<float> rays_o(N, 3, tcnn::RM);
+  // direction corresponding to pixels,in world coordination
+  tcnn::GPUMatrixDynamic<float> rays_d(N, 3, tcnn::RM);
 
-	const auto& snapshot = config["snapshot"];
-	// here not to check snapshot version, tmp==1
+  generate_rays(w, h, focal, c2w, rays_o, rays_d);
+  
 
-  std::vector<float> tmp_aabb(snapshot["aabb"].size(), 0);
-  for(int i=0;i<snapshot["aabb"].size();i++){
-    tmp_aabb[i] = snapshot["aabb"].at(i);
+  tcnn::GPUMatrixDynamic<float> rgb_fine(N, 3, tcnn::RM);
+  render_rays(N, rgb_fine, rays_o, rays_d, 128);
+  // TODO
+  // line 378-390 @ Nerf-Cuda/src/nerf_render.cu
+  // save array as a picture
+  
+  float* rgbs_host = new float[N * 3];
+  float* rgbs_dev; 
+  cudaMalloc((void **)&rgbs_dev, sizeof(float) * N * 3);
+  //cudaMemcpy(rgbs_dev, rgbs_host, sizeof(unsigned int) * N * 3, cudaMemcpyHostToDevice);
+
+  get_image<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rgb_fine.view(), N, rgbs_dev);
+  cudaMemcpy(rgbs_host, rgbs_dev, sizeof(unsigned int)*N*3, cudaMemcpyDeviceToHost);
+
+  unsigned char us_image[N*3];
+
+  for (int i = 0; i < N * 3; i++) {
+    us_image[i] = (unsigned char) (255.0 * rgbs_host[i]);        
   }
-  m_aabb.resize_and_copy_from_host(tmp_aabb);
-	m_bound = snapshot.value("bound", m_bound);
-	m_scale = snapshot.value("scale", m_scale);
-  m_dg_cascade = snapshot.value("cascade", m_dg_cascade);
-  m_dg_h = snapshot.value("density_grid_size", m_dg_h);
-  m_mean_density = snapshot.value("mean_density", m_mean_density);
-  std::vector<float> tmp_density_grid(snapshot["density_grid"].size(), 0);
-  for(int i=0;i<snapshot["density_grid"].size();i++){
-    tmp_density_grid[i] = snapshot["density_grid"].at(i);
+  
+  const char* filepath = "test.png";
+  stbi_write_png(filepath, h, w, 3, us_image, w*3);
+  FILE * fp;
+  if((fp = fopen("rgb.txt","wb"))==NULL){
+    printf("cant open the file");
+    exit(0);
   }
-  tlog::info() << tmp_density_grid[66 * m_dg_h * m_dg_h + 66 * m_dg_h + 66] 
-    << "\t" << tmp_density_grid[66 * m_dg_h * m_dg_h + 66 * m_dg_h + 67]
-    << "\t" << tmp_density_grid[66 * m_dg_h * m_dg_h + 66 * m_dg_h + 68]
-    << "\tDG";
-  m_density_grid.resize_and_copy_from_host(tmp_density_grid);
-  float host_data[3] = {0};
-  cudaMemcpy(host_data, &m_density_grid.data()[66 * m_dg_h * m_dg_h + 66 * m_dg_h + 66], 3 * sizeof(float), cudaMemcpyDeviceToHost);
-  tlog::info() << "density grid : " << host_data[0] << "\t" << host_data[1] << "\t" << host_data[2];
+  for(int i = 0; i < N; i++){
+    fprintf(fp, "%f ", rgbs_host[i]);
+  }
+  fclose(fp);
 
-	if (m_density_grid.size() != m_dg_h * m_dg_h * m_dg_h * m_dg_cascade) {
-		throw std::runtime_error{"Incompatible number of grid cascades."};
-	}
-
-	m_network_config_path = filepath_string;
-	m_network_config = config;
+  delete[] rgbs_host, rgbs_dev;
 }
 
 NGP_NAMESPACE_END
