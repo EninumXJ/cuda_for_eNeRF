@@ -6,3 +6,8 @@ $ cmake -B build -DCMAKE_CUDA_COMPILER=/usr/local/cuda-<your cuda version>/bin/n
 $ cd build
 $ make -j16
 ```
+
+## Check kernel
+```shell
+$ nsys nvprof ./testbed
+```
