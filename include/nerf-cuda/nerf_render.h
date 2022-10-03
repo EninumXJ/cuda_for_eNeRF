@@ -32,97 +32,56 @@ class NerfRender {
 
   // load network
   // need to do : load pretrained model !
-  void reload_network_from_file(const std::string& network_config_path);
-  nlohmann::json load_network_config(
-      const filesystem::path& network_config_path);
-  void reset_network();  // reset the network according to the network config.
+  void load_nerf_tree(long* index_voxels_coarse_h,
+                      float* sigma_voxels_coarse_h,
+                      float* voxels_fine_h,
+                      uint64_t* cg_s,
+                      uint64_t* fg_s);
 
   // render !
-  void set_resolution(Eigen::Vector2i resolution);
-  Image render_frame(
-      struct Camera cam, Eigen::Matrix<float, 4, 4> pos);  // render an image according to camera inner
-                                    // parameters and outer parameters.
+  void render_frame(int w, int h, float theta, float phi, float radius);  // render an image according to camera outer parameters.
 
-  void generate_rays(struct Camera cam, Eigen::Matrix<float, 4, 4> pos,
-                     Eigen::Vector2i resolution,
+  void generate_rays(int w, int h, float focal,
+                     Eigen::Matrix<float, 4, 4> c2w,
                      tcnn::GPUMatrixDynamic<float>& rays_o,
                      tcnn::GPUMatrixDynamic<float>& rays_d);
 
-  void generate_density_grid();
+  void render_rays(int N_rays,
+                   tcnn::GPUMatrixDynamic<float>& rgb_fine,
+                   tcnn::GPUMatrixDynamic<float>& rays_o,
+                   tcnn::GPUMatrixDynamic<float>& rays_d,
+                   int N_samples, 
+                   int N_importance, 
+                   float perturb);
+  
+  void inference(int N_rays, int N_samples_, int N_importance,
+                 tcnn::GPUMatrixDynamic<float>& rgb_fine,
+                 tcnn::GPUMatrixDynamic<float>& xyz_,
+                 tcnn::GPUMatrixDynamic<float>& dir_,
+                 tcnn::GPUMemory<float>& weights_coarse);
   void load_snapshot(const std::string& filepath_string);
 
+  void set_resolution(const int w, const int h);
+
  private:
-  tcnn::GPUMemory<float> m_aabb;
+  std::vector<float> m_aabb_v;
   // Scene parameters
   float m_bound = 1;
-  float m_scale = 0.33;
+  float m_scale = 1;
 
   // Random Number
   uint32_t m_seed = 42;
   tcnn::pcg32 m_rng;
 
   // density grid parameter !
-  float m_density_scale=1;
-  int m_dg_cascade = 1;
-  int m_dg_h = 128;
-  float m_dg_threshould_l = 1.e-4;
-  float m_mean_density = 1.e-4;
-  float m_dt_gamma = 1.0/128;
-  tcnn::GPUMemory<float> m_density_grid;
+  Eigen::Vector3i m_cg_s;
+  Eigen::Matrix<int,5,1> m_fg_s;
+
+  tcnn::GPUMemory<long> m_index_voxels_coarse;
+  tcnn::GPUMemory<float> m_sigma_voxels_coarse;
+  tcnn::GPUMemory<float> m_voxels_fine;
   // CASCADE * H * H * H * size_of(float),
   // index calculation : cascade_level * H * H * H + nx * H * H + ny * H + nz
-
-  // infer parameters
-  int m_bg_color = 1;
-  bool m_perturb = false;
-  float m_min_near = 0.2;
-  int m_num_thread = 128;
-  int m_max_infer_steps = 1024;
-
-  // middle variable
-  Eigen::Vector2i resolution;
-  // initial points corresponding to pixels, in world coordination
-  tcnn::GPUMatrixDynamic<float> rays_o;
-  // direction corresponding to pixels,in world coordination
-  tcnn::GPUMatrixDynamic<float> rays_d;
-  // Calculate rays' intersection time (near and far) with aabb
-  tcnn::GPUMatrixDynamic<float> nears;
-  tcnn::GPUMatrixDynamic<float> fars;
-  //  allocate outputs
-  tcnn::GPUMatrixDynamic<float> weight_sum;  // the accumlate weight of each ray
-  tcnn::GPUMatrixDynamic<float> depth;  // output depth img
-  tcnn::GPUMatrixDynamic<float> image;  // output rgb image
-  // store the alive rays number
-  tcnn::GPUMatrixDynamic<int> alive_counter;
-  // the alive rays' IDs in N (N >= n_alive, but we only use first n_alive)
-  // 2 is used to loop old/new
-  tcnn::GPUMatrixDynamic<int> rays_alive;
-  // the alive rays' time, we only use the first n_alive.
-  // dead rays are marked by rays_t < 0
-  //  2 is used to loop old/new
-  tcnn::GPUMatrixDynamic<float> rays_t;
-  tcnn::GPUMatrixDynamic<float> xyzs;
-  // all generated points' view dirs.
-  tcnn::GPUMatrixDynamic<float> dirs;
-  // all generated points' deltas
-  //(here we record two deltas, the first is for RGB, the second for depth).
-  tcnn::GPUMatrixDynamic<float> deltas;
-
-  // volume density
-  tcnn::GPUMatrixDynamic<float> sigmas;
-  // emitted color
-  tcnn::GPUMatrixDynamic<float> rgbs;
-
-  // concated input
-  tcnn::GPUMatrixDynamic<float> network_input;
-  // concated output
-  tcnn::GPUMatrixDynamic<precision_t> network_output;
-
-  float* deep_h;
-  float* image_h;
-  unsigned char* us_image;
-  unsigned char* us_depth;
-
 
   // Cuda Stuff
   cudaStream_t m_inference_stream;
@@ -131,6 +90,11 @@ class NerfRender {
   filesystem::path m_network_config_path;
   nlohmann::json m_network_config;
   std::shared_ptr<NerfNetwork<precision_t>> m_nerf_network;
+
+  // Middle variables
+  tcnn::GPUMatrixDynamic<float> m_rays_o;
+  tcnn::GPUMatrixDynamic<float> m_rays_d;
+  tcnn::GPUMatrixDynamic<float> m_rgb_fine;
 };
 
 NGP_NAMESPACE_END
