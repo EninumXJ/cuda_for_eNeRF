@@ -22,7 +22,7 @@
 #include <typeinfo>
 #include <vector>
 
-#define maxThreadsPerBlock 512
+#define maxThreadsPerBlock 256
 #define PI acos(-1)
 
 using namespace Eigen;
@@ -368,15 +368,14 @@ __global__ void get_image(MatrixView<float> rgb_final, const int N, float* rgbs)
 
 void NerfRender::render_frame(int w, int h, float theta, float phi, float radius) {
   auto c2w = pose_spherical(theta, phi, radius);
-  float focal = 0.5 * w / std::tan(0.5*0.6911112070083618);
+  float focal = 0.5 * w / std::tan(0.5*0.7814360959390334);
   int N = w * h;  // number of pixels
  
-  std::cout << "The bug is  here ?" << std::endl;
   m_rays_o.initialize_constant(0.);
   m_rays_d.initialize_constant(0.);
   generate_rays(w, h, focal, c2w, m_rays_o, m_rays_d);
   
-  m_rgb_fine.initialize_constant(1.);
+  m_rgb_fine.initialize_constant(0.);
   render_rays(N, m_rgb_fine, m_rays_o, m_rays_d, 128);
   // TODO
   // line 378-390 @ Nerf-Cuda/src/nerf_render.cu
