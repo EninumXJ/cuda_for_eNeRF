@@ -9,5 +9,5 @@ $ make -j16
 
 ## Check kernel
 ```shell
-$ nsys nvprof ./testbed
+$ nsys profile --stats=true ./testbed
 ```
