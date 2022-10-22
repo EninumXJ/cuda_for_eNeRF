@@ -22,7 +22,7 @@
 #include <typeinfo>
 #include <vector>
 
-#define maxThreadsPerBlock 256
+#define maxThreadsPerBlock 512
 #define PI acos(-1)
 
 using namespace Eigen;
@@ -99,9 +99,9 @@ void NerfRender::load_nerf_tree(long* index_voxels_coarse_h,
   int coarse_grid_num = m_cg_s[0] * m_cg_s[1] * m_cg_s[2];
   std::cout << "coarse_grid_num: " << coarse_grid_num << std::endl;
 
-  int fine_grid_num = m_fg_s[0] * m_fg_s[1] * m_fg_s[2] * m_fg_s[3] * m_fg_s[4];
-  std::cout << "coarse_grid_num: " << fine_grid_num << std::endl;
-
+  long long fine_grid_num = (long long)m_fg_s[0] * m_fg_s[1] * m_fg_s[2] * m_fg_s[3] * m_fg_s[4];
+  std::cout << "fine_grid_num: " << fine_grid_num << std::endl;
+  // std::cout << "real num: " << m_fg_s[0] * m_fg_s[1] * m_fg_s[2] * m_fg_s[3] * m_fg_s[4] << std::endl;
   m_index_voxels_coarse.resize(coarse_grid_num);
   m_index_voxels_coarse.copy_from_host(index_voxels_coarse_h);
   m_sigma_voxels_coarse.resize(coarse_grid_num);
@@ -171,8 +171,8 @@ __device__ __inline__ void _set_xyz(const float* __restrict__ rays_o,
 
 __device__ __inline__ float _z_vals(const int index, const int N) {
 
-  float near = 2.0; // val_dataset.near
-  float far = 6.0; // val_dataset.far
+  float near = 2.0 * 0.3; // val_dataset.near
+  float far = 9.0 * 0.3; // val_dataset.far
   return near + (far-near) / (N-1) * index;
 }
 
@@ -211,7 +211,7 @@ __global__ void query_fine(MatrixView<float> rgb_final,
     calc_index_(xyz_coarse, ijk_coarse_, grid_coarse);
 
     float sigmas = sigma_voxels_coarse[ijk_coarse_[0]*cg_s[1]*cg_s[2] + ijk_coarse_[1]*cg_s[2] + ijk_coarse_[2]];
-  
+    // printf("sigmas are:%f\n",sigmas);
     // line 264 @ efficient-nerf-render-demo/example-app/example-app.cpp
     if (sigmas < weight_threashold) {
       //float sigma_default = -20.0;
@@ -223,12 +223,15 @@ __global__ void query_fine(MatrixView<float> rgb_final,
       continue;
     }
 
+    // eval_sh
+    float basis_fn[9];
+    precalc_basis(vdir, basis_fn);
+
     for (int j_=0; j_<N_importance; j_++) {
       int j = i_*N_importance + j_;
       //int index_fine = i*N_samples_fine + index_coarse*N_importance + j;
 
       // calc_index_coarse
-
       
       float coord_scope = 3.0;
       float xyz_min = -coord_scope;
@@ -238,12 +241,11 @@ __global__ void query_fine(MatrixView<float> rgb_final,
       int ijk_coarse[3];
       float xyz_[3];
       _set_xyz(rays_o_, vdir, _z_vals(j, N_samples_fine), xyz_);
-
       // query_coarse_index
       calc_index_(xyz_, ijk_coarse, grid_coarse);
 
       int coarse_index = index_voxels_coarse[ijk_coarse[0]*cg_s[1]*cg_s[2]+ijk_coarse[1]*cg_s[2]+ijk_coarse[2]];
-
+      // printf("coarse_index : %d\n", coarse_index);
       // calc_index_fine
   
       int grid_fine = 3;
@@ -254,24 +256,22 @@ __global__ void query_fine(MatrixView<float> rgb_final,
       ijk_fine[0] = int((xyz_[0] - xyz_min) / xyz_scope * res_fine) % grid_fine;
       ijk_fine[1] = int((xyz_[1] - xyz_min) / xyz_scope * res_fine) % grid_fine;
       ijk_fine[2] = int((xyz_[2] - xyz_min) / xyz_scope * res_fine) % grid_fine;
-
+      // printf("ijk_fine[0] : %d\n", ijk_fine[0]);
       // line 195 @ efficient-nerf-render-demo/example-app/example-app.cpp
-      float sigma = (float)voxels_fine[coarse_index*fg_s[1]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[0]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[1]*fg_s[3]*fg_s[4] + ijk_fine[2]*fg_s[4]];
-
+      // printf("voxels_fine: %f", voxels_fine[120]);
+      long long fine_index = (long long)coarse_index*fg_s[1]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[0]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[1]*fg_s[3]*fg_s[4] + ijk_fine[2]*fg_s[4];
+      // printf("index of voxels_fine: %lld", fine_index);
+      float sigma = (float)voxels_fine[fine_index];
+      // printf("sigma is: %f\n", sigma);
       const int deg = 2;
       const int dim_sh = (deg + 1) * (deg + 1);
       float sh[3][dim_sh];
 
       for (int k=0; k<fg_s[4]-1; k++) {
-        sh[k/dim_sh][k%dim_sh] = (float)voxels_fine[coarse_index*fg_s[1]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[0]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[1]*fg_s[3]*fg_s[4] + ijk_fine[2]*fg_s[4] + k+1];
+        sh[k/dim_sh][k%dim_sh] = (float)voxels_fine[fine_index + k + 1];
       }
 
-      // eval_sh
-      float basis_fn[9];
-    
-      precalc_basis(vdir, basis_fn);
-
-
+      // printf("basis: %f", basis_fn[0]);
       float delta_coarse;
       if(j < N_samples_fine-1) 
         delta_coarse = _z_vals(j+1, N_samples_fine) - _z_vals(j, N_samples_fine);
@@ -282,14 +282,19 @@ __global__ void query_fine(MatrixView<float> rgb_final,
       weights_sum += weight;
       light_intensity *= att;
 
-      for (int t=0; t<3; t++) {
-        float tmp = 0.0;
-        for (int k=0; k<9; k++) {
-          tmp += basis_fn[k] * sh[t][k];
-        }
-        rgb_final(i, t) += _SIGMOID(tmp) * weight;
-      }
-
+      float tmp =0.0;
+      tmp = basis_fn[0] * sh[0][0] + basis_fn[1] * sh[0][1] + basis_fn[2] * sh[0][2] +
+            basis_fn[3] * sh[0][3] + basis_fn[4] * sh[0][4] + basis_fn[5] * sh[0][5] +
+            basis_fn[6] * sh[0][6] + basis_fn[7] * sh[0][7] + basis_fn[8] * sh[0][8];
+      rgb_final(i, 0) += _SIGMOID(tmp) * weight;
+      tmp = basis_fn[0] * sh[1][0] + basis_fn[1] * sh[1][1] + basis_fn[2] * sh[1][2] +
+            basis_fn[3] * sh[1][3] + basis_fn[4] * sh[1][4] + basis_fn[5] * sh[1][5] +
+            basis_fn[6] * sh[1][6] + basis_fn[7] * sh[1][7] + basis_fn[8] * sh[1][8];
+      rgb_final(i, 1) += _SIGMOID(tmp) * weight;
+      tmp = basis_fn[0] * sh[2][0] + basis_fn[1] * sh[2][1] + basis_fn[2] * sh[2][2] +
+            basis_fn[3] * sh[2][3] + basis_fn[4] * sh[2][4] + basis_fn[5] * sh[2][5] +
+            basis_fn[6] * sh[2][6] + basis_fn[7] * sh[2][7] + basis_fn[8] * sh[2][8];
+      rgb_final(i, 2) += _SIGMOID(tmp) * weight;
       float stop_thresh = 1e-4;
       if (light_intensity <= stop_thresh) {
         break;
@@ -300,7 +305,7 @@ __global__ void query_fine(MatrixView<float> rgb_final,
   rgb_final(i, 0) = rgb_final(i, 0) + 1 - weights_sum;
   rgb_final(i, 1) = rgb_final(i, 1) + 1 - weights_sum;
   rgb_final(i, 2) = rgb_final(i, 2) + 1 - weights_sum;
-  
+  // printf("rgb_final: %f\n", rgb_final(i, 0));
 }
 
 void NerfRender::inference(int N_rays, int N_samples_, int N_importance,
@@ -313,7 +318,7 @@ void NerfRender::inference(int N_rays, int N_samples_, int N_importance,
   // line 263-271 & 186-206 @ efficient-nerf-render-demo/example-app/example-app.cpp
   // use cuda to speed up
 
-  float weight_threashold = 1e-5;
+  float weight_threashold = 1e-4;
 
   dim3 threadsPerBlock(maxThreadsPerBlock/32, 32);
   dim3 numBlocks_coarse(div_round_up(N_rays, int(threadsPerBlock.x)), div_round_up(N_samples_, int(threadsPerBlock.y)));
@@ -344,6 +349,7 @@ void NerfRender::render_rays(int N_rays,
 void NerfRender::generate_rays(int w,
                                int h,
                                float focal,
+                               float* center,
                                Eigen::Matrix<float, 4, 4> c2w,
                                tcnn::GPUMatrixDynamic<float>& rays_o,
                                tcnn::GPUMatrixDynamic<float>& rays_d) {
@@ -351,12 +357,15 @@ void NerfRender::generate_rays(int w,
   // line 287-292 @ efficient-nerf-render-demo/example-app/example-app.cpp
   // use cuda to speed up
   int N = w * h;
-  set_rays_o<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_o.view(), c2w.block<3, 1>(0, 3), N);
-  set_rays_d<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_d.view(), c2w.block<3, 3>(0, 0), focal, w, h);
+  float scale = 0.3;
+  Eigen::Vector3f offset = Eigen::Vector3f(-0.85, 0, 0);
+  auto new_pose = nerf_matrix_to_ngp(c2w, scale, offset);
+  set_rays_o<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_o.view(), new_pose.block<3, 1>(0, 3), N);
+  set_rays_d<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_d.view(), new_pose.block<3, 3>(0, 0), focal, center, w, h);
   tlog::info() << c2w;
 }
 
-__global__ void get_image(MatrixView<float> rgb_final, const int N, float* rgbs){
+__global__ void get_image(MatrixView<float> rgb_final, int N, float* rgbs){
   const int i = threadIdx.x + blockIdx.x * blockDim.x;  // N
   if(i >= N){
     return;
@@ -364,23 +373,37 @@ __global__ void get_image(MatrixView<float> rgb_final, const int N, float* rgbs)
   rgbs[i*3] = rgb_final(i, 0);
   rgbs[i*3+1] = rgb_final(i, 1);
   rgbs[i*3+2] = rgb_final(i, 2);
+  // printf("rgbs: %f\n", rgbs[i*3]);
 }
 
 void NerfRender::render_frame(int w, int h, float theta, float phi, float radius) {
   auto c2w = pose_spherical(theta, phi, radius);
-  float focal = 0.5 * w / std::tan(0.5*0.7814360959390334);
+  c2w << -0.3164555916546028, -0.08060186108585553, 0.9451768080773424, 3.9187254837252734,
+          0.9485892037892081, -0.033047126434636705, 0.31477993882868455, 1.4167708528373393,
+          0.005863528577534578, 0.9961983875971426, 0.0869160031797175, 1.0845579674776806,
+          0.0, 0.0, 0.0, 1.0;
+  float focal = 0.5 * w / std::tan(0.5*1.4032185001629662);
+  // float focal = 0.5 * w / std::tan(0.5*0.6911112070083618);
+  float fl_x = 3550.114996400941;
+  float fl_y = 3554.5152821087413;
+  float c_x = 3010.450495927548;
+  float c_y = 1996.026944099408;
+  float img_w = 6000;
+  float img_h = 4000;
+  // float focal[2] = {fl_x * w / img_w, fl_y * h / img_h};
+  float center[2] = {c_x * w / img_w, c_y * h / img_h};
   int N = w * h;  // number of pixels
  
   m_rays_o.initialize_constant(0.);
   m_rays_d.initialize_constant(0.);
-  generate_rays(w, h, focal, c2w, m_rays_o, m_rays_d);
-  
+  generate_rays(w, h, focal, center, c2w, m_rays_o, m_rays_d);
+  std::cout << "Is it here?" << std::endl;
   m_rgb_fine.initialize_constant(0.);
   render_rays(N, m_rgb_fine, m_rays_o, m_rays_d, 128);
+
   // TODO
   // line 378-390 @ Nerf-Cuda/src/nerf_render.cu
   // save array as a picture
-
   float* rgbs_host = new float[N * 3];
   float* rgbs_dev; 
   cudaMalloc((void **)&rgbs_dev, sizeof(float)*N*3);
@@ -395,7 +418,8 @@ void NerfRender::render_frame(int w, int h, float theta, float phi, float radius
   }
   
   const char* filepath = "test.png";
-  stbi_write_png(filepath, h, w, 3, us_image, w*3);
+  std::cout << "write an image" << std::endl;
+  stbi_write_png(filepath, w, h, 3, us_image, w*3);
   FILE * fp;
   if((fp = fopen("rgb.txt","wb"))==NULL){
     printf("cant open the file");

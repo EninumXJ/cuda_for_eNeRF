@@ -41,7 +41,7 @@ class NerfRender {
   // render !
   void render_frame(int w, int h, float theta, float phi, float radius);  // render an image according to camera outer parameters.
 
-  void generate_rays(int w, int h, float focal,
+  void generate_rays(int w, int h, float focal, float* center,
                      Eigen::Matrix<float, 4, 4> c2w,
                      tcnn::GPUMatrixDynamic<float>& rays_o,
                      tcnn::GPUMatrixDynamic<float>& rays_d);
@@ -66,8 +66,8 @@ class NerfRender {
  private:
   std::vector<float> m_aabb_v;
   // Scene parameters
-  float m_bound = 1;
-  float m_scale = 1;
+  float m_bound = 1.;
+  float m_scale = 1.;
 
   // Random Number
   uint32_t m_seed = 42;
