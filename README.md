@@ -7,7 +7,7 @@ $ cd build
 $ make -j16
 ```
 
-## Check kernel
+## Test Speed
 ```shell
 $ nsys nvprof ./testbed
 ```
