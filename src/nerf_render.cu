@@ -24,53 +24,11 @@
 
 #define maxThreadsPerBlock 512
 #define PI acos(-1)
-
 using namespace Eigen;
 using namespace tcnn;
 namespace fs = filesystem;
 
 NGP_NAMESPACE_BEGIN
-
-__device__ __constant__ const float C0 = 0.28209479177387814;
-__device__ __constant__ const float C1 = 0.4886025119029199;
-__device__ __constant__ const float C2[] = {
-    1.0925484305920792,
-    -1.0925484305920792,
-    0.31539156525252005,
-    -1.0925484305920792,
-    0.5462742152960396
-};
-
-#define _SIGMOID(x) (1 / (1 + expf(-(x))))
-#define _SOFTPLUS_M1(x) (logf(1 + expf((x) - 1)))
-
-
-Eigen::Matrix<float, 4, 4> trans_t(float t){
-  Eigen::Matrix<float, 4, 4> mat;
-  mat << 1.0, 0.0, 0.0, 0.0,
-         0.0, 1.0, 0.0, 0.0,
-         0.0, 0.0, 1.0, t,
-         0.0, 0.0, 0.0, 1.0;
-  return mat;
-}
-
-Eigen::Matrix<float, 4, 4> rot_phi(float phi){
-  Eigen::Matrix<float, 4, 4> mat;
-  mat << 1.0, 0.0, 0.0, 0.0,
-         0.0, cos(phi), -sin(phi), 0.0,
-         0.0, sin(phi),  cos(phi), 0.0,
-         0.0, 0.0, 0.0, 1.0;
-  return mat;
-}
-
-Eigen::Matrix<float, 4, 4> rot_theta(float th){
-  Eigen::Matrix<float, 4, 4> mat;
-  mat << cos(th), 0.0, -sin(th), 0.0,
-         0.0, 1.0, 0.0, 0.0,
-         sin(th), 0.0,  cos(th), 0.0,
-         0.0, 0.0, 0.0, 1.0;
-  return mat;
-}
 
 NerfRender::NerfRender() {
   std::cout << "Hello, NerfRender!" << std::endl;
@@ -102,10 +60,10 @@ void NerfRender::load_nerf_tree(long* index_voxels_coarse_h,
   long long fine_grid_num = (long long)m_fg_s[0] * m_fg_s[1] * m_fg_s[2] * m_fg_s[3] * m_fg_s[4];
   std::cout << "fine_grid_num: " << fine_grid_num << std::endl;
   // std::cout << "real num: " << m_fg_s[0] * m_fg_s[1] * m_fg_s[2] * m_fg_s[3] * m_fg_s[4] << std::endl;
-  m_index_voxels_coarse.resize(coarse_grid_num);
-  m_index_voxels_coarse.copy_from_host(index_voxels_coarse_h);
-  m_sigma_voxels_coarse.resize(coarse_grid_num);
-  m_sigma_voxels_coarse.copy_from_host(sigma_voxels_coarse_h);
+  // m_index_voxels_coarse.resize(coarse_grid_num);
+  // m_index_voxels_coarse.copy_from_host(index_voxels_coarse_h);
+  // m_sigma_voxels_coarse.resize(coarse_grid_num);
+  // m_sigma_voxels_coarse.copy_from_host(sigma_voxels_coarse_h);
   m_voxels_fine.resize(fine_grid_num);
   m_voxels_fine.copy_from_host(voxels_fine_h);
   
@@ -114,66 +72,50 @@ void NerfRender::load_nerf_tree(long* index_voxels_coarse_h,
   // std::cout << "host_data[1]: " << host_data[1] << std::endl;
 }
 
-Eigen::Matrix<float, 4, 4> pose_spherical(float theta, float phi, float radius) {
-  Eigen::Matrix<float, 4, 4> c2w;
-  c2w = trans_t(radius);
-  c2w = rot_phi(phi / 180. * (float)PI) * c2w;
-  c2w = rot_theta(theta / 180. * (float)PI) * c2w;
-  Eigen::Matrix<float, 4, 4> temp_mat;
-  temp_mat << -1., 0., 0., 0.,
-               0., 0., 1., 0.,
-               0., 1., 0., 0.,
-               0., 0., 0., 1.; 
-  c2w = temp_mat * c2w; 
-  return c2w;
+
+__device__ uint32_t hash(uint32_t k, uint32_t HashTableCapacity)
+{
+    k ^= k >> 16;
+    k *= 0x85ebca6b;
+    k ^= k >> 13;
+    k *= 0xc2b2ae35;
+    k ^= k >> 16;
+    return k & (HashTableCapacity-1);
 }
 
+// Insert the key/values in kvs into the hashtable
+__global__ void gpu_hashtable_insert(KeyValue* hashtable, 
+                                     float* sigma_voxels,
+                                     long* index_voxels_coarse,
+                                     uint64_t* fg_s,
+                                     float threshold,
+                                     uint32_t hashcapacity, 
+                                     int numkvs)
+{
+    unsigned int threadid = blockIdx.x*blockDim.x + threadIdx.x;
+    if (threadid < numkvs)
+    {
+        if(sigma_voxels[threadid] > threshold)
+        {
+          uint32_t key = threadid;
+          uint32_t value = index_voxels_coarse[threadid]*fg_s[1]*fg_s[2]*fg_s[3]*fg_s[4];  // coarse_index
+          uint32_t slot = hash(key, hashcapacity);
+          // hashtable[slot].value = value;
+          while (true)
+          {
+            uint32_t prev = atomicCAS(&hashtable[slot].key, kEmpty, key);
+            if (prev == kEmpty || prev == key)
+            {
+                hashtable[slot].value = value;
+                break;
+            }
 
-__device__ __inline__ void precalc_basis(const float* __restrict__ dir, float* __restrict__ out) {
-  const float x = dir[0], y = dir[1], z = dir[2];
-  const float xx = x * x, yy = y * y, zz = z * z;
-  const float xy = x * y, yz = y * z, xz = x * z;
-  out[0] = C0;
-  out[1] = -C1 * y;
-  out[2] = C1 * z;
-  out[3] = -C1 * x;
-  out[4] = C2[0] * xy;
-  out[5] = C2[1] * yz;
-  out[6] = C2[2] * (2.0 * zz - xx - yy);
-  out[7] = C2[3] * xz;
-  out[8] = C2[4] * (xx - yy);
-}
-
-__device__ __inline__ void calc_index_(const float* __restrict__ xyz, 
-                                        int* __restrict__ ijk_, 
-                                        int grid_coarse) {
-  float coord_scope = 3.0;
-  float xyz_min = -coord_scope;
-  float xyz_max = coord_scope;
-  float xyz_scope = xyz_max - xyz_min;
-
-  for (int i=0; i<3; i++) {
-    ijk_[i] = int((xyz[i] - xyz_min) / xyz_scope * grid_coarse);
-    ijk_[i] = ijk_[i] < 0? 0 : ijk_[i];
-    ijk_[i] = ijk_[i] > grid_coarse-1? grid_coarse-1 : ijk_[i];
-  }
-}
-
-__device__ __inline__ void _set_xyz(const float* __restrict__ rays_o, 
-                                    const float* __restrict__ dir, 
-                                    const float z_val, 
-                                    float* __restrict__ out) {
-
-  out[0] = rays_o[0] + dir[0] * z_val;
-  out[1] = rays_o[1] + dir[1] * z_val;
-  out[2] = rays_o[2] + dir[2] * z_val;
-}
-
-__device__ __inline__ float _z_vals(const int index, const int N) {
-
-  float near = 2.0 * 0.3; // val_dataset.near
-  float far = 9.0 * 0.3; // val_dataset.far
-  return near + (far-near) / (N-1) * index;
+            slot = (slot + 1) & (hashcapacity-1);
+          }
+       }
+        else
+          return;  
+    }
 }
 
 __global__ void query_fine(MatrixView<float> rgb_final, 
@@ -183,6 +125,7 @@ __global__ void query_fine(MatrixView<float> rgb_final,
                            float weight_threashold, 
                            long* index_voxels_coarse,
                            float* voxels_fine,
+                           KeyValue* hashtable,
                            Eigen::Vector3i cg_s,
                            Eigen::Matrix<int,5,1> fg_s,
                            int N_importance, int N_samples_fine, int N_rays) {
@@ -209,30 +152,19 @@ __global__ void query_fine(MatrixView<float> rgb_final,
     float rays_o_[] = {rays_o(i, 0), rays_o(i, 1), rays_o(i, 2)};
     _set_xyz(rays_o_, vdir, _z_vals(i_, N_samples_coarse), xyz_coarse);
     calc_index_(xyz_coarse, ijk_coarse_, grid_coarse);
-
-    float sigmas = sigma_voxels_coarse[ijk_coarse_[0]*cg_s[1]*cg_s[2] + ijk_coarse_[1]*cg_s[2] + ijk_coarse_[2]];
-    // printf("sigmas are:%f\n",sigmas);
-    // line 264 @ efficient-nerf-render-demo/example-app/example-app.cpp
-    if (sigmas < weight_threashold) {
-      //float sigma_default = -20.0;
-      //sigmas[index_fine] = sigma_default;
-      //weights[index_fine] = 0.0;
-      //rgbs(index_fine, 0) = 1.0;
-      //rgbs(index_fine, 1) = 1.0;
-      //rgbs(index_fine, 2) = 1.0;
-      continue;
-    }
-
+    uint32_t hashcapacity = cg_s[0] * cg_s[1] * cg_s[2];
+    uint32_t key = ijk_coarse_[0]*cg_s[1]*cg_s[2]+ijk_coarse_[1]*cg_s[2]+ijk_coarse_[2];
+    uint32_t slot = hash(key, hashcapacity);
+    if(hashtable[slot].key == kEmpty)
+        continue;
+    
     // eval_sh
     float basis_fn[9];
     precalc_basis(vdir, basis_fn);
-
+    float stop_thresh = 1e-4;
     for (int j_=0; j_<N_importance; j_++) {
       int j = i_*N_importance + j_;
-      //int index_fine = i*N_samples_fine + index_coarse*N_importance + j;
-
       // calc_index_coarse
-      
       float coord_scope = 3.0;
       float xyz_min = -coord_scope;
       float xyz_max = coord_scope;
@@ -243,11 +175,34 @@ __global__ void query_fine(MatrixView<float> rgb_final,
       _set_xyz(rays_o_, vdir, _z_vals(j, N_samples_fine), xyz_);
       // query_coarse_index
       calc_index_(xyz_, ijk_coarse, grid_coarse);
-
-      int coarse_index = index_voxels_coarse[ijk_coarse[0]*cg_s[1]*cg_s[2]+ijk_coarse[1]*cg_s[2]+ijk_coarse[2]];
+      // int coarse_index = index_voxels_coarse[ijk_coarse[0]*cg_s[1]*cg_s[2]+ijk_coarse[1]*cg_s[2]+ijk_coarse[2]];
+      key = ijk_coarse[0]*cg_s[1]*cg_s[2]+ijk_coarse[1]*cg_s[2]+ijk_coarse[2];
+      slot = hash(key, hashcapacity);
+      uint32_t coarse_index;
+      // if(hashtable[slot].key == key)
+      //     coarse_index = hashtable[slot].value;
+      // else
+      //     continue;
+      while(true)
+      {
+          if(hashtable[slot].key == key)
+          {
+            coarse_index = hashtable[slot].value;
+            break;
+          }
+          if(hashtable[slot].key == kEmpty)
+          {
+            break;
+          }
+          slot = (slot + 1) & (hashcapacity - 1);
+      }
+     
+      if(hashtable[slot].key == kEmpty)
+          continue;
+      // int coarse_index = index_voxels_coarse[ijk_coarse[0]*cg_s[1]*cg_s[2]+ijk_coarse[1]*cg_s[2]+ijk_coarse[2]];
       // printf("coarse_index : %d\n", coarse_index);
-      // calc_index_fine
   
+
       int grid_fine = 3;
       int res_fine = grid_coarse * grid_fine;
 
@@ -259,7 +214,7 @@ __global__ void query_fine(MatrixView<float> rgb_final,
       // printf("ijk_fine[0] : %d\n", ijk_fine[0]);
       // line 195 @ efficient-nerf-render-demo/example-app/example-app.cpp
       // printf("voxels_fine: %f", voxels_fine[120]);
-      long long fine_index = (long long)coarse_index*fg_s[1]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[0]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[1]*fg_s[3]*fg_s[4] + ijk_fine[2]*fg_s[4];
+      uint32_t fine_index = coarse_index + ijk_fine[0]*fg_s[2]*fg_s[3]*fg_s[4] + ijk_fine[1]*fg_s[3]*fg_s[4] + ijk_fine[2]*fg_s[4];
       // printf("index of voxels_fine: %lld", fine_index);
       float sigma = (float)voxels_fine[fine_index];
       // printf("sigma is: %f\n", sigma);
@@ -295,12 +250,13 @@ __global__ void query_fine(MatrixView<float> rgb_final,
             basis_fn[3] * sh[2][3] + basis_fn[4] * sh[2][4] + basis_fn[5] * sh[2][5] +
             basis_fn[6] * sh[2][6] + basis_fn[7] * sh[2][7] + basis_fn[8] * sh[2][8];
       rgb_final(i, 2) += _SIGMOID(tmp) * weight;
-      float stop_thresh = 1e-4;
       if (light_intensity <= stop_thresh) {
         break;
       }
     }
-
+    if(light_intensity <= stop_thresh){
+      break;
+    }
   }
   rgb_final(i, 0) = rgb_final(i, 0) + 1 - weights_sum;
   rgb_final(i, 1) = rgb_final(i, 1) + 1 - weights_sum;
@@ -312,7 +268,8 @@ void NerfRender::inference(int N_rays, int N_samples_, int N_importance,
                            tcnn::GPUMatrixDynamic<float>& rgb_fine,
                            tcnn::GPUMatrixDynamic<float>& rays_o,
                            tcnn::GPUMatrixDynamic<float>& dir_,   
-                           tcnn::GPUMemory<float>& sigma_voxels_coarse) {
+                           tcnn::GPUMemory<float>& sigma_voxels_coarse,
+                           KeyValue* hashtable) {
   std::cout << "inference" << std::endl;
   // TODO
   // line 263-271 & 186-206 @ efficient-nerf-render-demo/example-app/example-app.cpp
@@ -329,6 +286,7 @@ void NerfRender::inference(int N_rays, int N_samples_, int N_importance,
                                                     weight_threashold, 
                                                     m_index_voxels_coarse.data(),
                                                     m_voxels_fine.data(),
+                                                    hashtable,
                                                     m_cg_s, m_fg_s,
                                                     N_importance, N_samples_, N_rays);
   
@@ -338,12 +296,13 @@ void NerfRender::render_rays(int N_rays,
                              tcnn::GPUMatrixDynamic<float>& rgb_fine,
                              tcnn::GPUMatrixDynamic<float>& rays_o,
                              tcnn::GPUMatrixDynamic<float>& rays_d,
+                             KeyValue* hashtable,
                              int N_samples=128, 
                              int N_importance=5, 
                              float perturb=0.) {
   std::cout << "render_rays" << std::endl;
   int N_samples_fine = N_samples * N_importance;
-  inference(N_rays, N_samples_fine, N_importance, rgb_fine, rays_o, rays_d, m_sigma_voxels_coarse);
+  inference(N_rays, N_samples_fine, N_importance, rgb_fine, rays_o, rays_d, m_sigma_voxels_coarse, hashtable);
 }
 
 void NerfRender::generate_rays(int w,
@@ -399,7 +358,7 @@ void NerfRender::render_frame(int w, int h, float theta, float phi, float radius
   generate_rays(w, h, focal, center, c2w, m_rays_o, m_rays_d);
   std::cout << "Is it here?" << std::endl;
   m_rgb_fine.initialize_constant(0.);
-  render_rays(N, m_rgb_fine, m_rays_o, m_rays_d, 128);
+  render_rays(N, m_rgb_fine, m_rays_o, m_rays_d, mhashtable, 128);
 
   // TODO
   // line 378-390 @ Nerf-Cuda/src/nerf_render.cu
@@ -431,6 +390,56 @@ void NerfRender::render_frame(int w, int h, float theta, float phi, float radius
   fclose(fp);
 
   delete[] rgbs_host, rgbs_dev;
+}
+
+void NerfRender::create_hashtable(float* sigma_voxels,
+                                  long* index_voxels_coarse,
+                                  uint64_t* cg_s,
+                                  uint64_t* fg_s){
+    
+    // allocate memory on GPU
+    cudaMalloc(&mhashtable, sizeof(KeyValue) * mHashTableCapacity);
+    std::cout << "Hash Size: " << mHashTableCapacity << std::endl;
+    // Initialize hash table to empty
+    static_assert(kEmpty == 0xffffffff, "memset expected kEmpty=0xffffffff");
+    cudaMemset(mhashtable, 0xff, sizeof(KeyValue) * mHashTableCapacity);
+    float* sigma_voxels_dev;
+    cudaMalloc(&sigma_voxels_dev, sizeof(float)*cg_s[0]*cg_s[1]*cg_s[2]);
+    cudaMemcpy(sigma_voxels_dev, sigma_voxels, sizeof(float)*cg_s[0]*cg_s[1]*cg_s[2], cudaMemcpyHostToDevice);
+    long* index_voxels_coarse_dev;
+    cudaMalloc(&index_voxels_coarse_dev, sizeof(long)*cg_s[0]*cg_s[1]*cg_s[2]);
+    cudaMemcpy(index_voxels_coarse_dev, index_voxels_coarse, sizeof(long)*cg_s[0]*cg_s[1]*cg_s[2], cudaMemcpyHostToDevice);
+    uint64_t* fg_s_dev;
+    cudaMalloc(&fg_s_dev, sizeof(uint64_t)*5);
+    cudaMemcpy(fg_s_dev, fg_s, sizeof(uint64_t)*5, cudaMemcpyHostToDevice);
+
+    float threshold = 1e-4;
+    // Have CUDA calculate the thread block size
+    // int mingridsize;
+    // int threadblocksize;
+    // cudaOccupancyMaxPotentialBlockSize(&mingridsize, &threadblocksize, gpu_hashtable_insert, 0, 0);
+    // int gridsize = ((uint32_t)mHashTableCapacity + threadblocksize - 1) / threadblocksize;
+    int num_kvs = cg_s[0] * cg_s[1] *cg_s[2];
+    // gpu_hashtable_insert<<<gridsize, threadblocksize>>>(mhashtable, sigma_voxels_dev, index_voxels_coarse_dev, fg_s_dev, threshold, (uint32_t)mHashTableCapacity, num_kvs);
+    gpu_hashtable_insert<<<div_round_up(num_kvs, maxThreadsPerBlock), maxThreadsPerBlock>>>(mhashtable, sigma_voxels_dev, index_voxels_coarse_dev, fg_s_dev, threshold, (uint32_t)mHashTableCapacity, num_kvs);
+    
+    KeyValue* nerf_hash = new KeyValue[mHashTableCapacity];
+    cudaMemcpy(nerf_hash, mhashtable, sizeof(KeyValue)*mHashTableCapacity, cudaMemcpyDeviceToHost);
+    std::cout << "nerf_hash[0].key: " << nerf_hash[0].key << std::endl;
+    std::cout << "nerf_hash[0].value: " << nerf_hash[0].value << std::endl;
+    cudaFree(nerf_hash);
+    cudaFree(index_voxels_coarse_dev);
+    cudaFree(sigma_voxels_dev);
+}
+
+void NerfRender::Test(float* sigma_voxels,
+                      long* index_voxels_coarse,
+                      uint64_t* cg_s,
+                      uint64_t* fg_s)
+{
+    //mHashTableCapacity = cg_s[0] * cg_s[1] * cg_s[2];
+    mHashTableCapacity = fg_s[0] * 50;
+    create_hashtable(sigma_voxels, index_voxels_coarse, cg_s, fg_s);
 }
 
 NGP_NAMESPACE_END

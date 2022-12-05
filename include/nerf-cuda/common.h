@@ -66,4 +66,43 @@ struct Camera {
     float cy;
 };
 
+#define _SIGMOID(x) (1 / (1 + expf(-(x))))
+#define _SOFTPLUS_M1(x) (logf(1 + expf((x) - 1)))
+
+
+Eigen::Matrix<float, 4, 4> trans_t(float t){
+  Eigen::Matrix<float, 4, 4> mat;
+  mat << 1.0, 0.0, 0.0, 0.0,
+         0.0, 1.0, 0.0, 0.0,
+         0.0, 0.0, 1.0, t,
+         0.0, 0.0, 0.0, 1.0;
+  return mat;
+}
+
+Eigen::Matrix<float, 4, 4> rot_phi(float phi){
+  Eigen::Matrix<float, 4, 4> mat;
+  mat << 1.0, 0.0, 0.0, 0.0,
+         0.0, cos(phi), -sin(phi), 0.0,
+         0.0, sin(phi),  cos(phi), 0.0,
+         0.0, 0.0, 0.0, 1.0;
+  return mat;
+}
+
+Eigen::Matrix<float, 4, 4> rot_theta(float th){
+  Eigen::Matrix<float, 4, 4> mat;
+  mat << cos(th), 0.0, -sin(th), 0.0,
+         0.0, 1.0, 0.0, 0.0,
+         sin(th), 0.0,  cos(th), 0.0,
+         0.0, 0.0, 0.0, 1.0;
+  return mat;
+}
+
+// Hash Key and Value
+struct KeyValue
+{
+    uint32_t key;
+    uint32_t value;
+};
+const uint32_t kEmpty = 0xffffffff;
+
 NGP_NAMESPACE_END
