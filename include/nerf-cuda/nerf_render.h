@@ -50,6 +50,7 @@ class NerfRender {
                    tcnn::GPUMatrixDynamic<float>& rgb_fine,
                    tcnn::GPUMatrixDynamic<float>& rays_o,
                    tcnn::GPUMatrixDynamic<float>& rays_d,
+                   KeyValue* hashtable,
                    int N_samples, 
                    int N_importance, 
                    float perturb);
@@ -58,11 +59,20 @@ class NerfRender {
                  tcnn::GPUMatrixDynamic<float>& rgb_fine,
                  tcnn::GPUMatrixDynamic<float>& xyz_,
                  tcnn::GPUMatrixDynamic<float>& dir_,
-                 tcnn::GPUMemory<float>& weights_coarse);
+                 tcnn::GPUMemory<float>& weights_coarse,
+                 KeyValue* hashtable);
   void load_snapshot(const std::string& filepath_string);
 
   void set_resolution(const int w, const int h);
 
+  void create_hashtable(float* sigma_voxels_coarse,
+                        long* index_voxels_coarse,
+                        uint64_t* cg_s,
+                        uint64_t* fg_s);
+
+  void insert_hashtable(KeyValue* pHashTable, const KeyValue* kvs, uint32_t num_kvs);  
+
+  void Test(float* sigma_voxels, long* index_voxels_coarse, uint64_t* cg_s, uint64_t* fg_s);  
  private:
   std::vector<float> m_aabb_v;
   // Scene parameters
@@ -95,6 +105,11 @@ class NerfRender {
   tcnn::GPUMatrixDynamic<float> m_rays_o;
   tcnn::GPUMatrixDynamic<float> m_rays_d;
   tcnn::GPUMatrixDynamic<float> m_rgb_fine;
+  KeyValue* m_nerf_voxels_index;
+
+  // hashtable
+  KeyValue* mhashtable;
+  uint32_t mHashTableCapacity;
 };
 
 NGP_NAMESPACE_END

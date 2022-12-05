@@ -75,7 +75,8 @@ __global__ void matrix_add_one(MatrixView<double> data, const int M = 5,
 
 int main(int argc, char** argv) {
 
-  cout << "Hello, Metavese!" << endl;
+  cout << "Hello, EfficientNeRF!" << endl;
+  cout << "Loading Model......" << endl;
   const std::string sigma_npy_path {"sigma_voxels_coarse_tv_new.npy"};
   const std::string index_npy_path {"index_voxels_coarse_tv_new.npy"};
   const std::string voxels_npy_path {"voxels_fine_tv_new.npy"};
@@ -89,7 +90,8 @@ int main(int argc, char** argv) {
   npy::LoadArrayFromNumpy(sigma_npy_path, coarse_shape, is_fortran, sigma_voxels_coarse);
   npy::LoadArrayFromNumpy(index_npy_path, shape, is_fortran, index_voxels_coarse);
   npy::LoadArrayFromNumpy(voxels_npy_path, fine_shape, is_fortran, voxels_fine);
-  std::cout << "Is it right?" << std::endl;
+  std::cout << "sigma size:" << sigma_voxels_coarse.size() << std::endl;
+  std::cout << "index size:" << index_voxels_coarse.size() << std::endl;
   long* index_voxels_coarse_h = new long[index_voxels_coarse.size()];
   float* sigma_voxels_coarse_h = new float[sigma_voxels_coarse.size()];
   float* voxels_fine_h = new float[voxels_fine.size()];
@@ -105,11 +107,12 @@ int main(int argc, char** argv) {
   }
 
   NerfRender* render = new NerfRender();
-  
+  // render->HashTest(sigma_voxels_coarse_h, index_voxels_coarse_h, coarse_shape);
   render->load_nerf_tree(index_voxels_coarse_h, sigma_voxels_coarse_h, voxels_fine_h, cg_s, fg_s);
+  render->Test(sigma_voxels_coarse_h, index_voxels_coarse_h, cg_s, fg_s);
+  std::cout << "Hash completed." << std::endl;
   render->set_resolution(1200, 800);
   render->render_frame(1200, 800, 90., -30., 4.);
-  // render->render_frame(800, 800, 90, 30, 4);
   // int deviceId;
   // cudaGetDevice(&deviceId);  // `deviceId` now points to the id of the currently
   //                            // active GPU.

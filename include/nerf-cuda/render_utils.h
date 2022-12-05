@@ -22,6 +22,7 @@
 
 using namespace Eigen;
 using namespace tcnn;
+#define PI acos(-1)
 
 NGP_NAMESPACE_BEGIN
 
@@ -70,8 +71,78 @@ Eigen::Matrix<float, 4, 4> nerf_matrix_to_ngp(
   return new_pose;
 }
 
-// Ray Marching functions
+// EfficientNeRF functions
+Eigen::Matrix<float, 4, 4> pose_spherical(float theta, float phi, float radius) {
+  Eigen::Matrix<float, 4, 4> c2w;
+  c2w = trans_t(radius);
+  c2w = rot_phi(phi / 180. * (float)PI) * c2w;
+  c2w = rot_theta(theta / 180. * (float)PI) * c2w;
+  Eigen::Matrix<float, 4, 4> temp_mat;
+  temp_mat << -1., 0., 0., 0.,
+               0., 0., 1., 0.,
+               0., 1., 0., 0.,
+               0., 0., 0., 1.; 
+  c2w = temp_mat * c2w; 
+  return c2w;
+}
 
+__device__ __constant__ const float C0 = 0.28209479177387814;
+__device__ __constant__ const float C1 = 0.4886025119029199;
+__device__ __constant__ const float C2[] = {
+    1.0925484305920792,
+    -1.0925484305920792,
+    0.31539156525252005,
+    -1.0925484305920792,
+    0.5462742152960396
+};
+__device__ __inline__ void precalc_basis(const float* __restrict__ dir, float* __restrict__ out) {
+  const float x = dir[0], y = dir[1], z = dir[2];
+  const float xx = x * x, yy = y * y, zz = z * z;
+  const float xy = x * y, yz = y * z, xz = x * z;
+  out[0] = C0;
+  out[1] = -C1 * y;
+  out[2] = C1 * z;
+  out[3] = -C1 * x;
+  out[4] = C2[0] * xy;
+  out[5] = C2[1] * yz;
+  out[6] = C2[2] * (2.0 * zz - xx - yy);
+  out[7] = C2[3] * xz;
+  out[8] = C2[4] * (xx - yy);
+}
+
+__device__ __inline__ void calc_index_(const float* __restrict__ xyz, 
+                                        int* __restrict__ ijk_, 
+                                        int grid_coarse) {
+  float coord_scope = 3.0;
+  float xyz_min = -coord_scope;
+  float xyz_max = coord_scope;
+  float xyz_scope = xyz_max - xyz_min;
+
+  for (int i=0; i<3; i++) {
+    ijk_[i] = int((xyz[i] - xyz_min) / xyz_scope * grid_coarse);
+    ijk_[i] = ijk_[i] < 0? 0 : ijk_[i];
+    ijk_[i] = ijk_[i] > grid_coarse-1? grid_coarse-1 : ijk_[i];
+  }
+}
+
+__device__ __inline__ void _set_xyz(const float* __restrict__ rays_o, 
+                                    const float* __restrict__ dir, 
+                                    const float z_val, 
+                                    float* __restrict__ out) {
+
+  out[0] = rays_o[0] + dir[0] * z_val;
+  out[1] = rays_o[1] + dir[1] * z_val;
+  out[2] = rays_o[2] + dir[2] * z_val;
+}
+
+__device__ __inline__ float _z_vals(const int index, const int N) {
+
+  float near = 2.0 * 0.3; // val_dataset.near
+  float far = 9.0 * 0.3; // val_dataset.far
+  return near + (far-near) / (N-1) * index;
+}
+
+// Ray Marching functions
 template <typename T>
 inline __host__ __device__ T div_round_up(T val, T divisor) {
   return (val + divisor - 1) / divisor;
