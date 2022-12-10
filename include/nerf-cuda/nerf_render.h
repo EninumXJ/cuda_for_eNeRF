@@ -39,10 +39,10 @@ class NerfRender {
                       uint64_t* fg_s);
 
   // render !
-  void render_frame(int w, int h, float theta, float phi, float radius);  // render an image according to camera outer parameters.
+  void render_frame(struct Camera cam, Eigen::Matrix<float, 4, 4> pos);  // render an image according to camera outer parameters.
 
-  void generate_rays(int w, int h, float focal,
-                     Eigen::Matrix<float, 4, 4> c2w,
+  void generate_rays(struct Camera cam, 
+                     Eigen::Matrix<float, 4, 4> pos,
                      tcnn::GPUMatrixDynamic<float>& rays_o,
                      tcnn::GPUMatrixDynamic<float>& rays_d);
 
@@ -61,7 +61,7 @@ class NerfRender {
                  tcnn::GPUMemory<float>& weights_coarse);
   void load_snapshot(const std::string& filepath_string);
 
-  void set_resolution(const int w, const int h);
+  void set_resolution(Eigen::Vector2i res);
 
  private:
   std::vector<float> m_aabb_v;
@@ -73,6 +73,7 @@ class NerfRender {
   uint32_t m_seed = 42;
   tcnn::pcg32 m_rng;
 
+  Eigen::Vector2i resolution;
   // density grid parameter !
   Eigen::Vector3i m_cg_s;
   Eigen::Matrix<int,5,1> m_fg_s;

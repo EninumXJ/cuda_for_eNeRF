@@ -73,9 +73,9 @@ __global__ void matrix_add_one(MatrixView<double> data, const int M = 5,
 int main(int argc, char** argv) {
 
   cout << "Hello, Metavese!" << endl;
-  const std::string sigma_npy_path {"sigma_voxels_coarse.npy"};
-  const std::string index_npy_path {"index_voxels_coarse.npy"};
-  const std::string voxels_npy_path {"voxels_fine.npy"};
+  const std::string sigma_npy_path {"sigma_voxels_coarse_tv_new.npy"};
+  const std::string index_npy_path {"index_voxels_coarse_tv_new.npy"};
+  const std::string voxels_npy_path {"voxels_fine_tv_new.npy"};
   std::vector<float> sigma_voxels_coarse;
   std::vector<long> index_voxels_coarse;
   std::vector<float> voxels_fine;
@@ -102,17 +102,20 @@ int main(int argc, char** argv) {
   }
 
   NerfRender* render = new NerfRender();
-  
+  Camera cam = {3550.115, 3554.515, 3010.45, 1996.027};
+  Eigen::Matrix<float, 4, 4> pos;
+  // pos << 0.15202418502518011, -0.037030882251750094, 0.9876828240656657, 4.584628725996896,
+  //        0.988339491272669, 0.014375140391964181, -0.15158629664192835, -0.8852494170206848,
+  //        -0.00858470495674949, 0.9992107230837872, 0.038784452328783726, 0.7921640240569777,
+  //        0.0, 0.0, 0.0, 1.0;
+  pos << -0.3164555916546028, -0.08060186108585553, 0.9451768080773424, 3.9187254837252734,
+          0.9485892037892081, -0.033047126434636705, 0.31477993882868455, 1.4167708528373393,
+          0.005863528577534578, 0.9961983875971426, 0.0869160031797175, 1.0845579674776806,
+          0.0, 0.0, 0.0, 1.0;
+  Eigen::Vector2i resolution(1200, 800);
   render->load_nerf_tree(index_voxels_coarse_h, sigma_voxels_coarse_h, voxels_fine_h, cg_s, fg_s);
-  render->set_resolution(800, 800);
-  render->render_frame(800, 800, 90, -30, 4);
+  render->set_resolution(resolution);
+  render->render_frame(cam, pos);
   // render->render_frame(800, 800, 90, 30, 4);
-  int deviceId;
-  cudaGetDevice(&deviceId);  // `deviceId` now points to the id of the currently
-                             // active GPU.
-
-  cudaDeviceProp props;
-  cudaGetDeviceProperties(&props, deviceId);
-  printDeviceProp(props);
 
 }

@@ -28,12 +28,13 @@ NGP_NAMESPACE_BEGIN
 // Initialization function !
 
 // Ray Generation
-__global__ void set_rays_d(MatrixView<float> rays_d, Eigen::Matrix<float, 3, 3> pose, float focal, int W, int H) {
+__global__ void set_rays_d(MatrixView<float> rays_d, Eigen::Matrix<float, 3, 3> pose,
+                           float focal, int W, int H) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     float i = tid % W;
     float j = tid / W;
-
+    
     float zs = -1;
     float xs = (i - W/2.) / focal;
     float ys = -(j - H/2.) / focal;
@@ -63,10 +64,10 @@ Eigen::Matrix<float, 4, 4> nerf_matrix_to_ngp(
     Eigen::Matrix<float, 4, 4> pose, float scale = 0.33,
     Eigen::Vector3f offset = Eigen::Vector3f(0, 0, 0)) {
   Eigen::Matrix<float, 4, 4> new_pose;
-  new_pose << pose(1, 0), -pose(1, 1), -pose(1, 2),
-      pose(1, 3) * scale + offset[0], pose(2, 0), -pose(2, 1), -pose(2, 2),
-      pose(2, 3) * scale + offset[1], pose(0, 0), -pose(0, 1), -pose(0, 2),
-      pose(0, 3) * scale + offset[2], 0, 0, 0, 1;
+  new_pose << pose(0, 0), pose(0, 1), pose(0, 2),
+      pose(0, 3) * scale + offset[0], pose(1, 0), pose(1, 1), pose(1, 2),
+      pose(1, 3) * scale + offset[1], pose(2, 0), pose(2, 1), pose(2, 2),
+      pose(2, 3) * scale + offset[2], 0, 0, 0, 1;
   return new_pose;
 }
 
