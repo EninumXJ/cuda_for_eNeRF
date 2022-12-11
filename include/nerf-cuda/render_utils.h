@@ -49,6 +49,27 @@ __global__ void set_rays_d(MatrixView<float> rays_d, Eigen::Matrix<float, 3, 3> 
     }
 }
 
+__global__ void set_rays_d_2(MatrixView<float> rays_d, Eigen::Matrix<float, 3, 3> pose,
+                           Camera cam, float downscale, int W, int H) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float i = tid % W;
+    float j = tid / W;
+    
+    float zs = -1;
+    float xs = (i - cam.cx*downscale) / (cam.fl_x*downscale);
+    float ys = -(j - cam.cy*downscale) / (cam.fl_y*downscale);
+    Eigen::Vector3f directions(xs, ys, zs);
+    directions = directions / directions.norm();
+    Eigen::Vector3f ray_d = pose * directions;
+
+    if (tid < W*H){
+        rays_d(tid, 0) = ray_d[0];
+        rays_d(tid, 1) = ray_d[1];
+        rays_d(tid, 2) = ray_d[2];
+    }
+}
+
 __global__ void set_rays_o(MatrixView<float> rays_o, Eigen::Vector3f ray_o, int N) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -68,6 +89,10 @@ Eigen::Matrix<float, 4, 4> nerf_matrix_to_ngp(
       pose(0, 3) * scale + offset[0], pose(1, 0), pose(1, 1), pose(1, 2),
       pose(1, 3) * scale + offset[1], pose(2, 0), pose(2, 1), pose(2, 2),
       pose(2, 3) * scale + offset[2], 0, 0, 0, 1;
+  // new_pose << pose(1,0), -pose(1,1), -pose(1,2), pose(1,3) * scale + offset[0],
+  //             pose(2,0), -pose(2,1), -pose(2,2), pose(2,3) * scale + offset[1],
+  //             pose(0,0), -pose(0,1), -pose(0,2), pose(0,3) * scale + offset[2],
+  //             0, 0, 0, 1;
   return new_pose;
 }
 

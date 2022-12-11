@@ -171,8 +171,8 @@ __device__ __inline__ void _set_xyz(const float* __restrict__ rays_o,
 
 __device__ __inline__ float _z_vals(const int index, const int N) {
 
-  float near = 2.0 * 0.3; // val_dataset.near
-  float far = 9.0 * 0.3; // val_dataset.far
+  float near = 2.0 * 1; // val_dataset.near
+  float far = 9.0 * 1; // val_dataset.far
   return near + (far-near) / (N-1) * index;
 }
 
@@ -295,7 +295,7 @@ __global__ void query_fine(MatrixView<float> rgb_final,
   rgb_final(i, 0) = rgb_final(i, 0) + 1 - weights_sum;
   rgb_final(i, 1) = rgb_final(i, 1) + 1 - weights_sum;
   rgb_final(i, 2) = rgb_final(i, 2) + 1 - weights_sum;
-  // printf("rgb_final: %f\n", rgb_final(i, 0));
+  printf("rgb_final: %f\n", rgb_final(i, 0));
 }
 
 void NerfRender::inference(int N_rays, int N_samples_, int N_importance,
@@ -344,14 +344,15 @@ void NerfRender::generate_rays(struct Camera cam,
   // line 287-292 @ efficient-nerf-render-demo/example-app/example-app.cpp
   // use cuda to speed up
   int N = resolution[0] * resolution[1];
-  // float focal[2] = {cam.fl_x * resolution[0] / img_w, cam.fl_y * resolution[1] / img_h};
-  float focal = 0.5 * resolution[0] / std::tan(0.5*1.4032185001629662);
-  float scale = 0.3;
+  float scale = 1;
+  float downscale = 0.2;
   Eigen::Vector3f offset = Eigen::Vector3f(-0.85, 0, 0);
+  // Eigen::Vector3f offset = Eigen::Vector3f(0, 0, 0);
   auto new_pose = nerf_matrix_to_ngp(pos, scale, offset);
   // Eigen::Matrix<float, 4, 4> new_pose = pos;
   set_rays_o<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_o.view(), new_pose.block<3, 1>(0, 3), N);
-  set_rays_d<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_d.view(), new_pose.block<3, 3>(0, 0), focal, resolution[0], resolution[1]);
+  // set_rays_d<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_d.view(), new_pose.block<3, 3>(0, 0), focal, resolution[0], resolution[1]);
+  set_rays_d_2<<<div_round_up(N, maxThreadsPerBlock), maxThreadsPerBlock>>>(rays_d.view(), new_pose.block<3, 3>(0, 0), cam, downscale, resolution[0], resolution[1]);
   tlog::info() << new_pose;
 }
 
@@ -379,9 +380,6 @@ void NerfRender::render_frame(struct Camera cam, Eigen::Matrix<float, 4, 4> pos)
   
   m_rgb_fine.initialize_constant(0.);
   render_rays(N, m_rgb_fine, m_rays_o, m_rays_d, 128);
-  // TODO
-  // line 378-390 @ Nerf-Cuda/src/nerf_render.cu
-  // save array as a picture
 
   float* rgbs_host = new float[N * 3];
   float* rgbs_dev; 
@@ -398,15 +396,15 @@ void NerfRender::render_frame(struct Camera cam, Eigen::Matrix<float, 4, 4> pos)
   std::cout << "get_image" << std::endl;
   const char* filepath = "test.png";
   stbi_write_png(filepath, w, h, 3, us_image, w*3); 
-  FILE * fp;
-  if((fp = fopen("rgb.txt","wb"))==NULL){
-    printf("cant open the file");
-    exit(0);
-  }
-  for(int i = 0; i < N; i++){
-    fprintf(fp, "%f ", rgbs_host[i]);
-  }
-  fclose(fp);
+  // FILE * fp;
+  // if((fp = fopen("rgb.txt","wb"))==NULL){
+  //   printf("cant open the file");
+  //   exit(0);
+  // }
+  // for(int i = 0; i < N; i++){
+  //   fprintf(fp, "%f ", rgbs_host[i]);
+  // }
+  // fclose(fp);
 
   delete[] rgbs_host, rgbs_dev;
 }
